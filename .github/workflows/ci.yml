@@ -20,7 +20,7 @@ jobs:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
@@ -63,7 +63,7 @@ jobs:
         allow-prereleases: true
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements*.txt') }}
@@ -103,7 +103,7 @@ jobs:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-3.11-${{ hashFiles('requirements*.txt') }}
@@ -112,7 +112,7 @@ jobs:
           ${{ runner.os }}-pip-
 
     - name: Cache transformers models
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-transformers-${{ hashFiles('requirements.txt') }}
@@ -147,7 +147,7 @@ jobs:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-3.11-${{ hashFiles('requirements*.txt') }}
