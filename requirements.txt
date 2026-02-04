@@ -2,7 +2,7 @@ numpy
 transformers[torch]
 google-play-scraper
 sentencepiece
-protobuf==3.20.*
+protobuf==6.33.*
 spacy
 gliner
 
