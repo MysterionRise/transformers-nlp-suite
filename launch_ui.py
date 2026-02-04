@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-UI Launcher - Launch all NLP demo UIs
+UI Launcher - Launch all NLP demo UIs and API server
 
-This script provides an easy way to launch all available interactive UIs.
+This script provides an easy way to launch all available interactive UIs
+and the production REST API server.
 """
 
 import argparse
@@ -74,17 +75,25 @@ UIS = {
     },
 }
 
+# API server configuration
+API_CONFIG = {
+    "name": "Enterprise NLP API",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "description": "Production REST API with authentication, rate limiting, and Swagger docs",
+}
+
 
 def print_banner():
     """Print welcome banner"""
     print("=" * 70)
-    print("  NLP Transformers Examples - Interactive UI Launcher")
+    print("  NLP Transformers Examples - Interactive UI & API Launcher")
     print("=" * 70)
     print()
 
 
 def list_uis():
-    """List all available UIs"""
+    """List all available UIs and API server"""
     print("Available UIs:")
     print()
     for key, info in UIS.items():
@@ -92,6 +101,14 @@ def list_uis():
         print(f"  {' ' * 15}   {info['description']}")
         print(f"  {' ' * 15}   Port: {info['port']}")
         print()
+
+    print("API Server:")
+    print()
+    print(f"  {'api':15} - {API_CONFIG['name']}")
+    print(f"  {' ' * 15}   {API_CONFIG['description']}")
+    print(f"  {' ' * 15}   Port: {API_CONFIG['port']}")
+    print(f"  {' ' * 15}   Docs: http://{API_CONFIG['host']}:{API_CONFIG['port']}/docs")
+    print()
 
 
 def launch_ui(ui_key: str):
@@ -128,17 +145,59 @@ def launch_ui(ui_key: str):
         return False
 
 
+def launch_api(host: str = None, port: int = None, reload: bool = False):
+    """Launch the FastAPI server"""
+    host = host or API_CONFIG["host"]
+    port = port or API_CONFIG["port"]
+
+    print(f"Launching {API_CONFIG['name']}...")
+    print(f"Host: {host}")
+    print(f"Port: {port}")
+    print(f"API URL: http://{host}:{port}")
+    print(f"Swagger Docs: http://{host}:{port}/docs")
+    print(f"ReDoc: http://{host}:{port}/redoc")
+    print()
+    print("Press Ctrl+C to stop the server")
+    print("-" * 70)
+    print()
+
+    try:
+        cmd = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "api.main:app",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+        if reload:
+            cmd.append("--reload")
+
+        subprocess.run(cmd, check=True)
+        return True
+    except KeyboardInterrupt:
+        print("\nShutting down API server...")
+        return True
+    except Exception as e:
+        print(f"Error launching API server: {e}")
+        return False
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Launch interactive UIs for NLP demos",
+        description="Launch interactive UIs and API server for NLP demos",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python launch_ui.py sentiment              # Launch sentiment analysis UI
   python launch_ui.py qa                     # Launch question answering UI
-  python launch_ui.py --list                 # List all available UIs
-  python launch_ui.py                        # Show menu to select UI
+  python launch_ui.py api                    # Launch REST API server
+  python launch_ui.py api --reload           # Launch API with auto-reload
+  python launch_ui.py --list                 # List all available options
+  python launch_ui.py                        # Show menu to select
 
 Available UIs:
   sentiment      - Sentiment Analysis Playground
@@ -151,18 +210,26 @@ Available UIs:
   zero_shot      - Zero-Shot Classifier
   translation    - Translation Hub
   vision         - Vision-Language Explorer
+
+API Server:
+  api            - Enterprise NLP REST API (Swagger docs at /docs)
         """,
     )
 
     parser.add_argument(
         "ui",
         nargs="?",
-        choices=list(UIS.keys()),
-        help="UI to launch (sentiment, similarity, ner, summarization, performance, "
-        "qa, generation, zero_shot, translation, vision)",
+        choices=list(UIS.keys()) + ["api"],
+        help="UI or API to launch (sentiment, similarity, ner, summarization, performance, "
+        "qa, generation, zero_shot, translation, vision, api)",
     )
 
-    parser.add_argument("--list", "-l", action="store_true", help="List all available UIs")
+    parser.add_argument("--list", "-l", action="store_true", help="List all available UIs and API")
+
+    # API-specific arguments
+    parser.add_argument("--host", type=str, help="API server host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, help="API server port (default: 8000)")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for API server (development)")
 
     args = parser.parse_args()
 
@@ -173,28 +240,34 @@ Available UIs:
         return 0
 
     if args.ui:
-        success = launch_ui(args.ui)
+        if args.ui == "api":
+            success = launch_api(host=args.host, port=args.port, reload=args.reload)
+        else:
+            success = launch_ui(args.ui)
         return 0 if success else 1
 
     # Interactive menu
     list_uis()
-    print("Enter the name of the UI you want to launch (or 'q' to quit):")
+    print("Enter the name of the UI or 'api' to launch (or 'q' to quit):")
     print()
 
     while True:
         try:
-            choice = input("UI> ").strip().lower()
+            choice = input("Select> ").strip().lower()
 
             if choice in ["q", "quit", "exit"]:
                 print("Goodbye!")
                 return 0
 
-            if choice in UIS:
+            if choice == "api":
+                launch_api()
+                break
+            elif choice in UIS:
                 launch_ui(choice)
                 break
             else:
-                print(f"Unknown UI: {choice}")
-                print("Available options:", ", ".join(UIS.keys()))
+                print(f"Unknown option: {choice}")
+                print("Available options:", ", ".join(list(UIS.keys()) + ["api"]))
 
         except KeyboardInterrupt:
             print("\nGoodbye!")

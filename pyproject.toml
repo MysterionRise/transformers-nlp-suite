@@ -1,6 +1,6 @@
 [tool.black]
 line-length = 120
-target-version = ['py311', 'py312', 'py313']
+target-version = ['py311', 'py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -25,6 +25,16 @@ profile = "black"
 line_length = 120
 filter_files = true
 skip_gitignore = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "venv", ".venv"]
+# B101: assert statements (used in tests)
+# B105: hardcoded password (dev defaults with clear warning in name)
+# B110: try-except-pass (intentional graceful degradation)
+# B404: subprocess import (needed for launcher)
+# B603: subprocess call (trusted paths only)
+# B607: partial path (using sys.executable)
+skips = ["B101", "B105", "B110", "B404", "B603", "B607"]
 
 [tool.pytest.ini_options]
 # Pytest config is in pytest.ini

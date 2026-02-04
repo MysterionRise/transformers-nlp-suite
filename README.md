@@ -1,17 +1,28 @@
 # NLP with Transformers - Interactive Examples
 
-A collection of practical NLP examples inspired by [Natural Language Processing with Transformers: Building Language Applications with Hugging Face](https://www.amazon.co.uk/gp/product/1098103246/ref=ppx_yo_dt_b_asin_title_o02_s00?ie=UTF8&psc=1) with **interactive web UIs** for hands-on experimentation.
+A collection of practical NLP examples inspired by [Natural Language Processing with Transformers: Building Language Applications with Hugging Face](https://www.amazon.co.uk/gp/product/1098103246/ref=ppx_yo_dt_b_asin_title_o02_s00?ie=UTF8&psc=1) with **interactive web UIs** and a **production REST API** for hands-on experimentation.
+
+[![Dependabot](https://img.shields.io/badge/Dependabot-enabled-brightgreen.svg)](https://github.com/MysterionRise/nlp-with-transformers-examples/network/updates)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## 🎯 Features
+
+### Enterprise REST API (NEW!)
+- 🚀 **Production FastAPI Server** - Full REST API with OpenAPI/Swagger documentation
+- 🔐 **Authentication** - API key and JWT token support
+- ⏱️ **Rate Limiting** - Per-user rate limits with configurable tiers
+- 📊 **Prometheus Metrics** - Full observability with `/metrics` endpoint
+- 📚 **Interactive Docs** - Swagger UI at `/docs` and ReDoc at `/redoc`
 
 ### Interactive UIs
 - 🎭 **Sentiment Analysis Playground** - Analyze sentiment with multiple models
 - 🔍 **Sentence Similarity Explorer** - Compare embeddings and semantic similarity
 - 🏷️ **NER Visualizer** - Extract and visualize named entities
 - 📝 **Text Summarization Studio** - Generate and compare text summaries
-- 📊 **Model Performance Dashboard** - Compare and evaluate model performance (NEW!)
+- 📊 **Model Performance Dashboard** - Compare and evaluate model performance
 
-### Production-Ready Infrastructure (Phase 2 ✨)
+### Production-Ready Infrastructure
 - ⚙️ **Centralized Configuration** - YAML-based model registry with 25+ pre-configured models
 - 🔄 **Smart Model Caching** - LRU cache with automatic GPU/CPU detection
 - 📝 **Structured Logging** - Colored console output with file rotation
@@ -72,6 +83,24 @@ python ui/ner_visualizer.py           # Port 7862
 python ui/summarization_studio.py     # Port 7863
 python ui/performance_dashboard.py    # Port 7864
 ```
+
+### Launch REST API Server
+
+```bash
+# Launch API server
+python launch_ui.py api
+
+# Launch with auto-reload (development)
+python launch_ui.py api --reload
+
+# Custom host/port
+python launch_ui.py api --host 0.0.0.0 --port 8080
+```
+
+After launching, access:
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
+- **OpenAPI JSON**: http://localhost:8000/openapi.json
 
 ## 📚 Interactive UIs Overview
 
@@ -172,6 +201,122 @@ Compare and evaluate model outputs using comprehensive NLP metrics.
 - Quality assessment of generated text
 - Benchmarking different models
 - Research and experimentation
+
+---
+
+## 🚀 REST API
+
+The Enterprise NLP API provides production-ready REST endpoints for all NLP tasks.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/sentiment` | POST | Analyze text sentiment |
+| `/api/v1/sentiment/batch` | POST | Batch sentiment analysis |
+| `/api/v1/summarize` | POST | Generate text summary |
+| `/api/v1/ner` | POST | Extract named entities |
+| `/api/v1/similarity` | POST | Compute text similarity |
+| `/api/v1/qa` | POST | Question answering |
+| `/api/v1/models` | GET | List available models |
+| `/health` | GET | Liveness probe |
+| `/ready` | GET | Readiness probe |
+| `/metrics` | GET | Prometheus metrics |
+
+### Authentication
+
+All API endpoints require authentication via:
+
+**API Key** (recommended for scripts):
+```bash
+curl -X POST http://localhost:8000/api/v1/sentiment \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "I love this product!"}'
+```
+
+**JWT Token** (for web apps):
+```bash
+# Get token
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+  -H "X-API-Key: dev-api-key" | jq -r '.access_token')
+
+# Use token
+curl -X POST http://localhost:8000/api/v1/sentiment \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "I love this product!"}'
+```
+
+### Example API Calls
+
+**Sentiment Analysis:**
+```bash
+curl -X POST http://localhost:8000/api/v1/sentiment \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "This product exceeded all my expectations!",
+    "model": "twitter_roberta_multilingual"
+  }'
+```
+
+**Text Summarization:**
+```bash
+curl -X POST http://localhost:8000/api/v1/summarize \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Artificial intelligence has transformed numerous industries...",
+    "min_length": 30,
+    "max_length": 100
+  }'
+```
+
+**Named Entity Recognition:**
+```bash
+curl -X POST http://localhost:8000/api/v1/ner \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Apple CEO Tim Cook announced new products in Cupertino.",
+    "entity_types": ["PERSON", "ORG", "GPE"]
+  }'
+```
+
+**Semantic Similarity:**
+```bash
+curl -X POST http://localhost:8000/api/v1/similarity \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text1": "The weather is beautiful today.",
+    "text2": "It is a lovely sunny day outside."
+  }'
+```
+
+**Question Answering:**
+```bash
+curl -X POST http://localhost:8000/api/v1/qa \
+  -H "X-API-Key: dev-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the capital of France?",
+    "context": "France is a country in Western Europe. Its capital is Paris."
+  }'
+```
+
+### Rate Limiting
+
+Requests are rate-limited based on your API key tier:
+- **Admin**: 1000 requests/minute
+- **User**: 100 requests/minute
+- **Demo**: 20 requests/minute
+
+Rate limit headers are included in all responses:
+- `X-RateLimit-Limit`: Maximum requests per window
+- `X-RateLimit-Remaining`: Remaining requests
+- `X-RateLimit-Reset`: Unix timestamp when window resets
 
 ---
 
@@ -289,6 +434,13 @@ Comprehensive NLP evaluation with BLEU, ROUGE, METEOR, BERTScore.
 - nltk - BLEU scores
 - rouge-score - ROUGE metrics
 - bert-score - BERT-based evaluation
+
+### API Dependencies
+- fastapi>=0.109.0 - REST API framework
+- uvicorn[standard] - ASGI server
+- python-jose[cryptography] - JWT authentication
+- slowapi - Rate limiting
+- prometheus-client - Metrics
 
 See `requirements.txt` for full list.
 

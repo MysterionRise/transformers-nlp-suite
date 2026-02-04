@@ -4,7 +4,6 @@ Settings and configuration management for NLP Transformers Examples
 Uses Pydantic for settings validation and YAML for model configurations.
 """
 
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,6 +11,58 @@ from typing import Any, Dict, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+
+
+class APIKeyConfig(BaseModel):
+    """Configuration for a single API key"""
+
+    name: str
+    role: str = "user"  # admin, user, readonly
+    rate_limit: int = 100  # requests per minute
+    enabled: bool = True
+
+
+class APISettings(BaseModel):
+    """
+    API-specific settings for authentication and rate limiting
+    """
+
+    # JWT settings
+    jwt_secret: str = Field(
+        default="change-this-secret-in-production",
+        description="Secret key for JWT token signing. MUST be changed in production.",
+    )
+    jwt_algorithm: str = Field(default="HS256", description="Algorithm for JWT encoding")
+    jwt_expiration_hours: int = Field(default=24, description="JWT token expiration time in hours")
+
+    # API Keys - dict of api_key -> config
+    api_keys: Dict[str, Dict[str, Any]] = Field(
+        default_factory=lambda: {
+            "dev-api-key": {
+                "name": "Development",
+                "role": "admin",
+                "rate_limit": 1000,
+                "enabled": True,
+            },
+            "demo-api-key": {
+                "name": "Demo User",
+                "role": "user",
+                "rate_limit": 100,
+                "enabled": True,
+            },
+        },
+        description="API keys with their configurations",
+    )
+
+    # Rate limiting defaults
+    default_rate_limit: int = Field(default=100, description="Default requests per minute")
+    rate_limit_window_seconds: int = Field(default=60, description="Rate limit window in seconds")
+
+    # CORS settings
+    cors_origins: List[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Allowed CORS origins",
+    )
 
 
 class ModelConfig(BaseModel):
@@ -67,6 +118,13 @@ class Settings(BaseSettings):
     )
     data_dir: Path = Field(default_factory=lambda: Path("data"), description="Data directory")
     logs_dir: Path = Field(default_factory=lambda: Path("logs"), description="Logs directory")
+
+    # API settings
+    api: APISettings = Field(default_factory=APISettings, description="API-specific settings")
+
+    # API server settings
+    api_host: str = Field(default="127.0.0.1", description="API server host")
+    api_port: int = Field(default=8000, description="API server port")
 
     class Config:
         env_prefix = "NLP_"
