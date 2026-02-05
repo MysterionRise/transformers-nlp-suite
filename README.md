@@ -1,8 +1,8 @@
-# NLP with Transformers - Interactive Examples
+# Transformers NLP Suite
 
-A collection of practical NLP examples inspired by [Natural Language Processing with Transformers: Building Language Applications with Hugging Face](https://www.amazon.co.uk/gp/product/1098103246/ref=ppx_yo_dt_b_asin_title_o02_s00?ie=UTF8&psc=1) with **interactive web UIs** and a **production REST API** for hands-on experimentation.
+Enterprise NLP Platform with production REST API, authentication, rate limiting, observability, and interactive UIs. Built with Hugging Face Transformers, FastAPI, and Gradio.
 
-[![Dependabot](https://img.shields.io/badge/Dependabot-enabled-brightgreen.svg)](https://github.com/MysterionRise/nlp-with-transformers-examples/network/updates)
+[![Dependabot](https://img.shields.io/badge/Dependabot-enabled-brightgreen.svg)](https://github.com/MysterionRise/transformers-nlp-suite/network/updates)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -43,8 +43,8 @@ A collection of practical NLP examples inspired by [Natural Language Processing 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/MysterionRise/nlp-with-transformers-examples.git
-cd nlp-with-transformers-examples
+git clone https://github.com/MysterionRise/transformers-nlp-suite.git
+cd transformers-nlp-suite
 ```
 
 2. Install dependencies:
