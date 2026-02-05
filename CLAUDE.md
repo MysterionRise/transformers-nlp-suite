@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Transformers NLP Suite - Claude Code Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with the Transformers NLP Suite repository.
 
 ## Quick Reference
 
