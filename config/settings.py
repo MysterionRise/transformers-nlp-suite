@@ -66,6 +66,11 @@ class ModelConfig(BaseModel):
     framework: Optional[str] = "transformers"
     prefix: Optional[str] = None
     template: Optional[bool] = False
+    revision: Optional[str] = Field(default=None, description="Pinned Hugging Face revision (commit SHA)")
+    language_pairs: Optional[List[str]] = None
+    domain: Optional[str] = None
+    entity_types: Optional[List[str]] = None
+    modalities: Optional[List[str]] = None
 
 
 class Settings(BaseSettings):
@@ -82,18 +87,20 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", description="Logging level")
 
     # Model settings
-    cache_dir: Path = Field(
-        default_factory=lambda: Path.home() / ".cache" / "huggingface",
-        description="Directory for caching models",
+    cache_dir: Optional[Path] = Field(
+        default=None,
+        description="Model download cache. Unset uses the Hugging Face default (HF_HOME, ~/.cache/huggingface/hub).",
     )
-    max_cached_models: int = Field(default=3, description="Maximum number of models to keep in memory")
+    max_cached_models: int = Field(default=3, ge=1, description="Maximum number of models to keep in memory")
     device: str = Field(default="auto", description="Device to run models on (auto, cpu, cuda, mps)")
 
     # UI settings
-    ui_theme: str = Field(default="default", description="Gradio theme")
+    ui_theme: str = Field(default="soft", description="Gradio theme: soft, default, glass, monochrome, base")
     share: bool = Field(default=False, description="Create public Gradio links")
-    server_name: str = Field(default="127.0.0.1", description="Server host")
-    server_port: int = Field(default=7860, description="Starting port for UIs")
+    server_name: str = Field(
+        default="127.0.0.1", description="Host the Gradio UIs bind to; set NLP_SERVER_NAME=0.0.0.0 in containers"
+    )
+    server_port: int = Field(default=7860, description="Port of the combined UI app (individual UIs use fixed ports)")
 
     # Performance settings
     max_workers: int = Field(default=4, description="Maximum number of workers for parallel processing")

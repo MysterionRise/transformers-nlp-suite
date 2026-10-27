@@ -1,347 +1,230 @@
 """
-Sentiment Analysis Playground - Interactive UI for sentiment classification
+Sentiment Analysis - classify text as negative, neutral or positive.
 
-Features:
-- Real-time sentiment analysis on user input
-- Multiple model comparison
-- Confidence scores with visual bars
-- Batch processing support
-- Example texts for quick testing
+Models come from the ``sentiment_analysis``, ``financial_sentiment`` and
+``retail`` registry categories and load through the shared model cache, so the
+same weights serve this page, the other tools and the API in one process.
 """
 
-import logging
-from typing import Dict, Tuple
+import re
+import sys
+from collections import Counter
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
+import pandas as pd
 import plotly.graph_objects as go
-from transformers import pipeline
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/sentiment_playground.py`
+    import common as shell  # type: ignore[no-redef]
 
-# Available sentiment analysis models
-SENTIMENT_MODELS = {
-    "Twitter RoBERTa (Multilingual)": "cardiffnlp/twitter-xlm-roberta-base-sentiment",
-    "Twitter RoBERTa (English)": "cardiffnlp/twitter-roberta-base-sentiment-latest",
-    "DistilBERT SST-2": "distilbert-base-uncased-finetuned-sst-2-english",
-    "BERT Base (SST-2)": "textattack/bert-base-uncased-SST-2",
-}
+logger = shell.get_logger(__name__)
 
-# Cache for loaded models
-model_cache = {}
+UI_KEY = "sentiment"
+MODELS = shell.ModelMenu(
+    "sentiment_analysis",
+    "financial_sentiment",
+    "retail",
+    default="twitter_roberta_multilingual",
+)
+
+# Colour by meaning, not by score, so a winning "negative" bar is never green.
+LABEL_COLORS = {"negative": "#d1495b", "neutral": "#8d99ae", "positive": "#2a9d8f"}
+STAR_COLORS = {1: "#d1495b", 2: "#ee8959", 3: "#8d99ae", 4: "#84b59f", 5: "#2a9d8f"}
+BATCH_COLUMNS = ["#", "Text", "Sentiment", "Confidence"]
 
 
-def load_model(model_name: str):
-    """Load or retrieve cached sentiment analysis model"""
-    if model_name not in model_cache:
-        logger.info(f"Loading model: {model_name}")
+def _label_color(label: str) -> str:
+    if label in LABEL_COLORS:
+        return LABEL_COLORS[label]
+    stars = re.match(r"^(\d)\s*star", label)
+    if stars:
+        return STAR_COLORS.get(int(stars.group(1)), "#8d99ae")
+    return "#6c757d"
+
+
+def _scores(raw: Any, classifier: Any) -> List[Tuple[str, float]]:
+    """Normalise pipeline output to [(label, score)] sorted by score, highest first."""
+    if isinstance(raw, dict):
+        raw = [raw]
+    if raw and isinstance(raw[0], list):
+        raw = raw[0]
+    num_labels = shell.num_labels_of(classifier)
+    scores = [(shell.normalize_sentiment_label(item["label"], num_labels), float(item["score"])) for item in raw]
+    return sorted(scores, key=lambda pair: pair[1], reverse=True)
+
+
+def _chart(scores: List[Tuple[str, float]]) -> go.Figure:
+    labels = [label for label, _ in reversed(scores)]
+    values = [score for _, score in reversed(scores)]
+    fig = go.Figure(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker_color=[_label_color(label) for label in labels],
+            text=[f"{value:.1%}" for value in values],
+            textposition="auto",
+        )
+    )
+    fig.update_layout(
+        xaxis=dict(range=[0, 1], title="Probability", tickformat=".0%"),
+        height=80 + 45 * len(labels),
+        margin=dict(l=10, r=10, t=10, b=40),
+    )
+    return fig
+
+
+def analyze_sentiment(text: str, model_name: str) -> Tuple[Dict[str, Any], go.Figure]:
+    """Classify one text; returns a result summary and a score chart."""
+    text = shell.require_text(text, "some text to analyze")
+    choice = MODELS.get(model_name)
+    classifier = MODELS.load(model_name)
+    used = shell.clip_for_model(text, classifier, label="Text")
+    try:
+        raw = classifier(used, top_k=None)
+    except Exception as exc:
+        shell.fail_from(exc, "Sentiment analysis")
+
+    scores = _scores(raw, classifier)
+    top_label, top_score = scores[0]
+    result = {
+        "prediction": top_label,
+        "confidence": f"{top_score:.1%}",
+        "scores": {label: round(score, 4) for label, score in scores},
+        "model": choice.model_id,
+        "truncated": used != text,
+    }
+    return result, _chart(scores)
+
+
+def analyze_batch(text: str, model_name: str) -> Tuple[pd.DataFrame, str]:
+    """Classify one text per line; a failing line is reported in its row, not for the whole batch."""
+    items = shell.split_items(text, what="one line of text")
+    classifier = MODELS.load(model_name)
+    limit = shell.token_limit(classifier)
+
+    rows, counts, truncated = [], Counter(), 0
+    for index, item in enumerate(items, 1):
+        used, _ = shell.truncate_to_tokens(item, classifier.tokenizer, limit)
+        truncated += used != item
         try:
-            model_cache[model_name] = pipeline(
-                "sentiment-analysis",
-                model=SENTIMENT_MODELS[model_name],
-                tokenizer=SENTIMENT_MODELS[model_name],
-                top_k=None,  # Return all scores
-            )
-            logger.info(f"Model {model_name} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model {model_name}: {e}")
-            raise
-    return model_cache[model_name]
+            raw = classifier(used, top_k=None)
+            label, score = _scores(raw, classifier)[0]
+            counts[label] += 1
+            rows.append([index, item, label, f"{score:.1%}"])
+        except Exception as exc:
+            logger.warning(f"Batch item {index} failed: {exc}")
+            rows.append([index, item, "error", str(exc)[:120]])
+
+    if truncated:
+        shell.warn(f"{truncated} line(s) exceeded the model's {limit}-token limit and were truncated.")
+    summary = " · ".join(f"**{label}**: {count}" for label, count in counts.most_common()) or "No results"
+    return pd.DataFrame(rows, columns=BATCH_COLUMNS), f"{len(items)} texts analyzed. {summary}"
 
 
-def analyze_sentiment(text: str, model_name: str) -> Tuple[Dict, str]:
-    """
-    Analyze sentiment of the input text
-
-    Args:
-        text: Input text to analyze
-        model_name: Name of the model to use
-
-    Returns:
-        Tuple of (results dict, visualization HTML)
-    """
-    if not text or not text.strip():
-        return {"error": "Please provide some text to analyze"}, ""
-
-    try:
-        # Load model
-        classifier = load_model(model_name)
-
-        # Get predictions
-        results = classifier(text[:512])[0]  # Limit to 512 chars for speed
-
-        # Format results
-        formatted_results = {}
-        labels = []
-        scores = []
-
-        for result in results:
-            label = result["label"]
-            score = result["score"]
-            formatted_results[label] = f"{score:.4f} ({score * 100:.2f}%)"
-            labels.append(label)
-            scores.append(score)
-
-        # Get the top prediction
-        top_result = max(results, key=lambda x: x["score"])
-        formatted_results["Prediction"] = top_result["label"]
-        formatted_results["Confidence"] = f"{top_result['score'] * 100:.2f}%"
-
-        # Create visualization
-        fig = go.Figure(
-            data=[
-                go.Bar(
-                    x=scores,
-                    y=labels,
-                    orientation="h",
-                    marker=dict(color=scores, colorscale="RdYlGn", showscale=False),
-                    text=[f"{s * 100:.1f}%" for s in scores],
-                    textposition="auto",
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title="Sentiment Confidence Scores",
-            xaxis_title="Confidence",
-            yaxis_title="Sentiment",
-            height=300,
-            margin=dict(l=20, r=20, t=40, b=20),
-            xaxis=dict(range=[0, 1]),
-        )
-
-        return formatted_results, fig
-
-    except Exception as e:
-        logger.error(f"Error analyzing sentiment: {e}")
-        return {"error": f"Error: {str(e)}"}, None
-
-
-def analyze_batch(text: str, model_name: str, delimiter: str = "\n") -> str:
-    """
-    Analyze multiple texts in batch
-
-    Args:
-        text: Multiple texts separated by delimiter
-        model_name: Name of the model to use
-        delimiter: Delimiter to split texts (default: newline)
-
-    Returns:
-        Formatted results as string
-    """
-    if not text or not text.strip():
-        return "Please provide some text to analyze"
-
-    try:
-        # Split texts
-        texts = [t.strip() for t in text.split(delimiter) if t.strip()]
-
-        if not texts:
-            return "No valid text found"
-
-        # Load model
-        classifier = load_model(model_name)
-
-        # Analyze each text
-        results = []
-        for i, txt in enumerate(texts, 1):
-            pred = classifier(txt[:512])[0]
-            top = max(pred, key=lambda x: x["score"])
-            results.append(
-                f"{i}. {txt[:50]}{'...' if len(txt) > 50 else ''}\n"
-                f"   → {top['label']} ({top['score'] * 100:.2f}%)\n"
-            )
-
-        return "\n".join(results)
-
-    except Exception as e:
-        logger.error(f"Error in batch analysis: {e}")
-        return f"Error: {str(e)}"
-
-
-# Example texts for testing - organized by industry
 EXAMPLES = [
-    # General examples
+    ["This movie was absolutely fantastic! I loved every minute of it.", "Twitter RoBERTa (Multilingual)"],
+    ["I'm so disappointed with this product. Complete waste of money.", "Twitter RoBERTa (Multilingual)"],
+    ["El servicio fue rápido y el personal muy amable.", "Twitter RoBERTa (Multilingual)"],
     [
-        "This movie was absolutely fantastic! I loved every minute of it.",
-        "Twitter RoBERTa (Multilingual)",
-    ],
-    [
-        "I'm so disappointed with this product. Complete waste of money.",
-        "Twitter RoBERTa (Multilingual)",
-    ],
-    # Retail / E-commerce examples
-    [
-        "The Samsung Galaxy S24 Ultra is amazing! Camera quality is exceptional and battery lasts all day.",
-        "Twitter RoBERTa (Multilingual)",
-    ],
-    [
-        "Terrible experience with Amazon delivery. Package was damaged and customer service was unhelpful.",
+        "Terrible experience with the delivery. Package was damaged and customer service was unhelpful.",
         "Twitter RoBERTa (English)",
     ],
+    ["The running shoes are comfortable but overpriced. Decent quality overall.", "DistilBERT SST-2"],
+    ["Another biased and misleading article. The author clearly didn't research the facts.", "BERT Base (SST-2)"],
     [
-        "The Nike Air Max shoes are comfortable but overpriced. Decent quality for running.",
-        "DistilBERT SST-2",
+        "Quarterly revenue grew 12% and the company raised its full-year guidance.",
+        "FinBERT",
     ],
-    # Publishing / Media examples
-    [
-        "Brilliant investigative journalism by The New York Times. Important truths about corporate corruption.",
-        "Twitter RoBERTa (Multilingual)",
-    ],
-    [
-        "Another biased and misleading article. The author clearly didn't research the facts.",
-        "BERT Base (SST-2)",
-    ],
-    # Healthcare / Life Sciences examples
-    [
-        "The new immunotherapy treatment has been life-changing. My symptoms have significantly improved.",
-        "Twitter RoBERTa (Multilingual)",
-    ],
-    [
-        "Frustrated with long wait times at the hospital. Appointment was at 2pm but wasn't seen until 4pm.",
-        "DistilBERT SST-2",
-    ],
-    # Financial examples
-    [
-        "Impressed with Goldman Sachs quarterly results. Strong revenue growth and excellent dividend yield!",
-        "Twitter RoBERTa (English)",
-    ],
+    ["Battery died after two weeks and the seller ignored my emails.", "Amazon Review Sentiment"],
 ]
 
-# Industry-specific batch examples
 # fmt: off
 BATCH_EXAMPLES = {
-    "Retail Reviews": (
-        "I love my new Apple MacBook Pro! The M3 chip is incredibly fast and the battery lasts forever.\n"
-        "The Dyson vacuum stopped working after just 2 months. Very disappointed with the quality.\n"
-        "Decent headphones from Sony. Good sound quality but the ear cushions could be more comfortable.\n"
-        "Best customer service experience at Costco! They replaced my defective item immediately.\n"
-        "This IKEA furniture was a nightmare to assemble. Missing screws and confusing instructions."
+    "Retail reviews": (
+        "I love my new laptop! The chip is incredibly fast and the battery lasts forever.\n"
+        "The vacuum stopped working after just 2 months. Very disappointed with the quality.\n"
+        "Decent headphones. Good sound quality but the ear cushions could be more comfortable.\n"
+        "Best customer service experience! They replaced my defective item immediately.\n"
+        "This furniture was a nightmare to assemble. Missing screws and confusing instructions."
     ),
-    "Healthcare Feedback": (
-        "The doctors at Mayo Clinic were exceptional. They explained my diagnosis thoroughly.\n"
+    "Healthcare feedback": (
+        "The doctors were exceptional. They explained my diagnosis thoroughly.\n"
         "Long wait times in the emergency room. Was in severe pain but had to wait 3 hours.\n"
         "Physical therapy sessions have been helpful but scheduling is difficult.\n"
         "Very satisfied with my telehealth consultation. Convenient and professional.\n"
         "Disappointed with the billing department. Received unexpected charges."
     ),
-    "Financial Services": (
-        "Excellent mobile banking app from Chase. Easy to deposit checks and track spending. 5 stars!\n"
+    "Financial services": (
+        "Excellent mobile banking app. Easy to deposit checks and track spending.\n"
         "Hidden fees everywhere with this credit card. The annual fee wasn't clearly disclosed.\n"
-        "My financial advisor at Fidelity helped me build a solid retirement portfolio.\n"
+        "My financial advisor helped me build a solid retirement portfolio.\n"
         "The loan approval process took forever. Submitted all documents but still waiting.\n"
-        "Great interest rates on savings account. Competitive returns without huge minimum balance."
+        "Great interest rates on the savings account without a huge minimum balance."
     ),
 }
 # fmt: on
 
+ABOUT = """
+Scores are the model's probabilities over its own labels. They sum to 1 for one model but are not
+comparable across models. Labels are normalised to **negative / neutral / positive**; binary SST-2
+models have no neutral class, and the review model predicts **1 to 5 stars**.
 
-def create_ui():
-    """Create and configure the Gradio interface"""
+Tips: try the same text with several models, and use the multilingual model for non-English text.
+"""
 
-    with gr.Blocks(title="Sentiment Analysis Playground", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-            # 🎭 Sentiment Analysis Playground
 
-            Analyze the sentiment of text using state-of-the-art transformer models.
-            Try different models and see how they perform on your text!
-            """)
-
-        with gr.Tab("Single Text Analysis"):
+def create_ui() -> gr.Blocks:
+    """Build the sentiment page."""
+    with shell.page(UI_KEY) as demo:
+        with gr.Tab("Single text"):
             with gr.Row():
-                with gr.Column(scale=2):
+                with gr.Column(scale=3):
                     text_input = gr.Textbox(
-                        label="Enter text to analyze",
-                        placeholder="Type or paste your text here...",
+                        label="Text to analyze",
+                        placeholder="Type or paste a review, comment or message...",
                         lines=5,
                     )
-                    model_dropdown = gr.Dropdown(
-                        choices=list(SENTIMENT_MODELS.keys()),
-                        value="Twitter RoBERTa (Multilingual)",
-                        label="Select Model",
-                    )
-                    analyze_btn = gr.Button("Analyze Sentiment", variant="primary")
-
+                    model_dropdown = MODELS.dropdown()
+                    analyze_btn = gr.Button("Analyze sentiment", variant="primary")
                 with gr.Column(scale=2):
-                    output_json = gr.JSON(label="Results")
-                    output_plot = gr.Plot(label="Confidence Visualization")
+                    output_json = gr.JSON(label="Result")
+                    output_plot = gr.Plot(label="Probability per label")
+            gr.Examples(examples=EXAMPLES, inputs=[text_input, model_dropdown], label="Try an example")
 
-            gr.Examples(
-                examples=EXAMPLES,
-                inputs=[text_input, model_dropdown],
-                label="Try these examples",
-            )
-
-        with gr.Tab("Batch Analysis"):
-            gr.Markdown("""
-                ### Process multiple texts at once
-                Enter multiple texts separated by new lines. Each line will be analyzed separately.
-                """)
-
+        with gr.Tab("Batch"):
+            gr.Markdown(f"One text per line, up to {shell.MAX_BATCH_ITEMS} lines.")
             with gr.Row():
-                with gr.Column():
+                with gr.Column(scale=2):
                     batch_input = gr.Textbox(
-                        label="Enter multiple texts (one per line)",
-                        placeholder="Text 1\nText 2\nText 3\n...",
+                        label="Texts (one per line)",
+                        placeholder="First review\nSecond review\n...",
                         lines=10,
                     )
-                    batch_model = gr.Dropdown(
-                        choices=list(SENTIMENT_MODELS.keys()),
-                        value="Twitter RoBERTa (Multilingual)",
-                        label="Select Model",
+                    batch_model = MODELS.dropdown()
+                    batch_btn = gr.Button("Analyze all", variant="primary")
+                    with gr.Row():
+                        for name, sample in BATCH_EXAMPLES.items():
+                            gr.Button(f"Load: {name}", size="sm").click(lambda s=sample: s, outputs=batch_input)
+                with gr.Column(scale=3):
+                    batch_summary = gr.Markdown()
+                    batch_output = gr.Dataframe(
+                        headers=BATCH_COLUMNS,
+                        label="Results",
+                        wrap=True,
+                        interactive=False,
                     )
-                    batch_btn = gr.Button("Analyze All", variant="primary")
 
-                with gr.Column():
-                    batch_output = gr.Textbox(label="Batch Results", lines=15, max_lines=20)
+        shell.about(ABOUT, MODELS)
 
-            gr.Markdown("### Industry Example Batches")
-            gr.Markdown("*Click to load pre-made batch examples for different industries:*")
-            with gr.Row():
-                for industry_name, industry_text in BATCH_EXAMPLES.items():
-                    btn = gr.Button(industry_name, size="sm")
-                    btn.click(lambda x=industry_text: x, outputs=batch_input)
-
-        with gr.Tab("About"):
-            gr.Markdown("""
-                ## About This Tool
-
-                This sentiment analysis playground allows you to experiment with different
-                transformer-based sentiment analysis models.
-
-                ### Available Models:
-
-                1. **Twitter RoBERTa (Multilingual)** - Trained on multilingual Twitter data
-                2. **Twitter RoBERTa (English)** - Optimized for English Twitter text
-                3. **DistilBERT SST-2** - Fast and efficient, trained on Stanford Sentiment Treebank
-                4. **BERT Base (SST-2)** - BERT model fine-tuned on SST-2 dataset
-
-                ### Features:
-                - Real-time sentiment analysis
-                - Confidence scores for all sentiment classes
-                - Visual confidence distribution
-                - Batch processing support
-                - Multiple model comparison
-
-                ### Tips:
-                - Shorter texts (< 512 characters) work best
-                - Try the same text with different models to compare
-                - Use batch mode for analyzing multiple reviews or comments
-                """)
-
-        # Connect the components
-        analyze_btn.click(
-            fn=analyze_sentiment,
-            inputs=[text_input, model_dropdown],
-            outputs=[output_json, output_plot],
-        )
-
-        batch_btn.click(fn=analyze_batch, inputs=[batch_input, batch_model], outputs=[batch_output])
-
+        analyze_btn.click(analyze_sentiment, inputs=[text_input, model_dropdown], outputs=[output_json, output_plot])
+        text_input.submit(analyze_sentiment, inputs=[text_input, model_dropdown], outputs=[output_json, output_plot])
+        batch_btn.click(analyze_batch, inputs=[batch_input, batch_model], outputs=[batch_output, batch_summary])
     return demo
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])

@@ -29,6 +29,7 @@ _MODEL_CACHE_EXPORTS = {
     "load_model_by_id",
     "load_sentence_transformer",
     "load_spacy_model",
+    "load_registry_model",
     "clear_model_cache",
     "get_cache_info",
 }
@@ -71,6 +72,7 @@ __all__ = [
     "load_model_by_id",
     "load_sentence_transformer",
     "load_spacy_model",
+    "load_registry_model",
     "clear_model_cache",
     "get_cache_info",
 ]

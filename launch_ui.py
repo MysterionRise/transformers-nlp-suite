@@ -7,77 +7,40 @@ and the production REST API server.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
-# Available UIs with their configurations
+from ui.catalog import UIS as UI_CATALOG
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Available UIs, derived from ui/catalog.py (kept as plain dicts for callers and tests)
 UIS = {
-    "sentiment": {
-        "name": "Sentiment Analysis Playground",
-        "file": "ui/sentiment_playground.py",
-        "port": 7860,
-        "description": "Analyze sentiment with multiple models",
-    },
-    "similarity": {
-        "name": "Sentence Similarity Explorer",
-        "file": "ui/similarity_explorer.py",
-        "port": 7861,
-        "description": "Compare sentence embeddings and semantic similarity",
-    },
-    "ner": {
-        "name": "NER Visualizer",
-        "file": "ui/ner_visualizer.py",
-        "port": 7862,
-        "description": "Extract and visualize named entities",
-    },
-    "summarization": {
-        "name": "Text Summarization Studio",
-        "file": "ui/summarization_studio.py",
-        "port": 7863,
-        "description": "Generate and compare text summaries",
-    },
-    "performance": {
-        "name": "Model Performance Dashboard",
-        "file": "ui/performance_dashboard.py",
-        "port": 7864,
-        "description": "Compare and evaluate model performance",
-    },
-    "qa": {
-        "name": "Question Answering System",
-        "file": "ui/qa_system.py",
-        "port": 7865,
-        "description": "Extract answers from context using QA models",
-    },
-    "generation": {
-        "name": "Text Generation Playground",
-        "file": "ui/generation_playground.py",
-        "port": 7866,
-        "description": "Generate creative text completions",
-    },
-    "zero_shot": {
-        "name": "Zero-Shot Classifier",
-        "file": "ui/zero_shot_classifier.py",
-        "port": 7867,
-        "description": "Classify text into custom categories without training data",
-    },
-    "translation": {
-        "name": "Translation Hub",
-        "file": "ui/translation_hub.py",
-        "port": 7868,
-        "description": "Translate between 50+ languages",
-    },
-    "vision": {
-        "name": "Vision-Language Explorer",
-        "file": "ui/vision_language_explorer.py",
-        "port": 7869,
-        "description": "Analyze images with vision-language models",
-    },
+    key: {
+        "name": entry.title,
+        "file": entry.file,
+        "module": entry.import_path,
+        "port": entry.port,
+        "description": entry.description,
+    }
+    for key, entry in UI_CATALOG.items()
+}
+
+# All UIs in one Gradio app: one process, one port, one shared model cache
+ALL_IN_ONE = {
+    "name": "All demo UIs (combined app)",
+    "file": "ui/app.py",
+    "module": "ui.app",
+    "port": 7860,
+    "description": "Every UI as a tab in one app sharing a single model cache",
 }
 
 # API server configuration
 API_CONFIG = {
-    "name": "Customer Intelligence NLP Platform API",
+    "name": "Transformers NLP Suite API",
     "host": "127.0.0.1",
     "port": 8000,
     "description": "API-first customer intelligence service with auth, rate limiting, metrics, and Swagger docs",
@@ -87,7 +50,7 @@ API_CONFIG = {
 def print_banner():
     """Print welcome banner"""
     print("=" * 70)
-    print("  Customer Intelligence NLP Platform - UI & API Launcher")
+    print("  Transformers NLP Suite - UI & API Launcher")
     print("=" * 70)
     print()
 
@@ -102,6 +65,11 @@ def list_uis():
         print(f"  {' ' * 15}   Port: {info['port']}")
         print()
 
+    print(f"  {'all':15} - {ALL_IN_ONE['name']}")
+    print(f"  {' ' * 15}   {ALL_IN_ONE['description']}")
+    print(f"  {' ' * 15}   Port: {ALL_IN_ONE['port']} (override with --port)")
+    print()
+
     print("API Server:")
     print()
     print(f"  {'api':15} - {API_CONFIG['name']}")
@@ -111,31 +79,46 @@ def list_uis():
     print()
 
 
-def launch_ui(ui_key: str):
-    """Launch a specific UI"""
-    if ui_key not in UIS:
+def launch_ui(ui_key: str, host: Optional[str] = None, port: Optional[int] = None):
+    """
+    Launch one UI (or ``all`` for the combined app) as ``python -m ui.<module>``.
+
+    Runs from the repository root so imports work from any working directory.
+    ``host`` and ``port`` are forwarded as ``--host`` / ``--port``; without them the
+    UI binds to NLP_SERVER_NAME and its catalog port (NLP_SERVER_PORT for ``all``).
+    """
+    if ui_key == "all":
+        ui_info = ALL_IN_ONE
+    elif ui_key in UIS:
+        ui_info = UIS[ui_key]
+    else:
         print(f"Error: Unknown UI '{ui_key}'")
         print()
         list_uis()
         return False
 
-    ui_info = UIS[ui_key]
-    ui_file = Path(ui_info["file"])
-
+    ui_file = PROJECT_ROOT / ui_info["file"]
     if not ui_file.exists():
         print(f"Error: UI file not found: {ui_file}")
         return False
 
+    shown_host = host or os.environ.get("NLP_SERVER_NAME", "127.0.0.1")
+    shown_port = port or ui_info["port"]
+
     print(f"Launching {ui_info['name']}...")
-    print(f"Port: {ui_info['port']}")
-    print(f"URL: http://localhost:{ui_info['port']}")
+    print(f"URL: http://{shown_host}:{shown_port}")
     print()
     print("Press Ctrl+C to stop the server")
     print("-" * 70)
     print()
 
+    command = [sys.executable, "-m", ui_info["module"]]
+    if host:
+        command += ["--host", host]
+    if port:
+        command += ["--port", str(port)]
     try:
-        subprocess.run([sys.executable, str(ui_file)], check=True)
+        subprocess.run(command, check=True, cwd=PROJECT_ROOT)
         return True
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -188,47 +171,49 @@ def launch_api(host: str = None, port: int = None, reload: bool = False):
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Launch optional UIs and the Customer Intelligence API server",
+        description="Launch the Transformers NLP Suite API server or its demo UIs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python launch_ui.py sentiment              # Launch sentiment analysis UI
   python launch_ui.py qa                     # Launch question answering UI
+  python launch_ui.py all                    # Every UI as tabs in one app (port 7860)
+  python launch_ui.py all --host 0.0.0.0     # ...reachable from other machines/containers
   python launch_ui.py api                    # Launch REST API server
   python launch_ui.py api --reload           # Launch API with auto-reload
   python launch_ui.py --list                 # List all available options
   python launch_ui.py                        # Show menu to select
 
 Available UIs:
-  sentiment      - Sentiment Analysis Playground
-  similarity     - Sentence Similarity Explorer
-  ner            - Named Entity Recognition Visualizer
-  summarization  - Text Summarization Studio
-  performance    - Model Performance Dashboard
-  qa             - Question Answering System
-  generation     - Text Generation Playground
-  zero_shot      - Zero-Shot Classifier
-  translation    - Translation Hub
-  vision         - Vision-Language Explorer
+  sentiment      - Sentiment Analysis
+  similarity     - Semantic Similarity
+  ner            - Named Entity Recognition
+  summarization  - Summarization
+  performance    - Evaluation Metrics
+  qa             - Question Answering
+  generation     - Text Generation
+  zero_shot      - Zero-Shot Classification
+  translation    - Translation
+  vision         - Vision-Language
+  all            - Every UI in one app with a shared model cache
 
 API Server:
-  api            - Customer Intelligence API (Swagger docs at /docs)
+  api            - REST API (Swagger docs at /docs)
         """,
     )
 
     parser.add_argument(
         "ui",
         nargs="?",
-        choices=list(UIS.keys()) + ["api"],
-        help="UI or API to launch (sentiment, similarity, ner, summarization, performance, "
-        "qa, generation, zero_shot, translation, vision, api)",
+        choices=list(UIS.keys()) + ["all", "api"],
+        help="UI to launch, 'all' for every UI in one app, or 'api' for the REST API",
     )
 
     parser.add_argument("--list", "-l", action="store_true", help="List all available UIs and API")
 
     # API-specific arguments
-    parser.add_argument("--host", type=str, help="API server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, help="API server port (default: 8000)")
+    parser.add_argument("--host", type=str, help="Bind address for the API or UI (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, help="Port for the API (default 8000) or UI (default: catalog port)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for API server (development)")
 
     args = parser.parse_args()
@@ -243,7 +228,7 @@ API Server:
         if args.ui == "api":
             success = launch_api(host=args.host, port=args.port, reload=args.reload)
         else:
-            success = launch_ui(args.ui)
+            success = launch_ui(args.ui, host=args.host, port=args.port)
         return 0 if success else 1
 
     # Interactive menu
@@ -262,12 +247,12 @@ API Server:
             if choice == "api":
                 launch_api()
                 break
-            elif choice in UIS:
+            elif choice in UIS or choice == "all":
                 launch_ui(choice)
                 break
             else:
                 print(f"Unknown option: {choice}")
-                print("Available options:", ", ".join(list(UIS.keys()) + ["api"]))
+                print("Available options:", ", ".join(list(UIS.keys()) + ["all", "api"]))
 
         except KeyboardInterrupt:
             print("\nGoodbye!")
