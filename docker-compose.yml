@@ -1,11 +1,29 @@
-version: '3.8'
+# Transformers NLP Suite
+#
+#   docker compose up api redis                    # REST API on :8000 (canonical)
+#   docker compose --profile ui up ui-launcher     # all demo UIs in one app on :7860
+#   docker compose --profile individual up qa      # one UI per container (7860-7869)
+#
+# The "ui" and "individual" profiles both use host port 7860 for sentiment, so run
+# one or the other.
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: transformers-nlp-suite:latest
+  networks:
+    - nlp-network
+
+x-ui-env: &ui-env
+  PYTHONUNBUFFERED: "1"
+  NLP_SERVER_NAME: "0.0.0.0"
+  NLP_LOG_LEVEL: "INFO"
 
 services:
-  # Canonical API service for portfolio review
+  # Canonical API service
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-api
     command: python launch_ui.py api --host 0.0.0.0 --port 8000
     ports:
@@ -21,8 +39,6 @@ services:
       - huggingface_cache:/home/nlpuser/.cache/huggingface
     depends_on:
       - redis
-    networks:
-      - nlp-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -45,137 +61,94 @@ services:
       timeout: 5s
       retries: 3
 
-  # UI launcher is optional: docker compose --profile ui up ui-launcher
+  # Every demo UI as a tab in one Gradio app: one process, one shared model cache
   ui-launcher:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-ui-launcher
+    command: python launch_ui.py all --host 0.0.0.0 --port 7860
     ports:
-      - "7860:7860"  # Sentiment Analysis
-      - "7861:7861"  # Similarity Explorer
-      - "7862:7862"  # NER Visualizer
-      - "7863:7863"  # Summarization Studio
-      - "7864:7864"  # Performance Dashboard
-      - "7865:7865"  # Question Answering
-      - "7866:7866"  # Text Generation
-      - "7867:7867"  # Zero-Shot Classifier
-      - "7868:7868"  # Translation Hub
-      - "7869:7869"  # Vision-Language Explorer
-    environment:
-      - PYTHONUNBUFFERED=1
-      - NLP_DEBUG=false
-      - NLP_LOG_LEVEL=INFO
+      - "7860:7860"
+    environment: *ui-env
     volumes:
-      - ./data:/app/data:ro  # Mount sample data
-      - ./logs:/app/logs     # Mount logs
-      - huggingface_cache:/home/nlpuser/.cache/huggingface  # Cache models
-    networks:
-      - nlp-network
+      - ./data:/app/data:ro
+      - ./logs:/app/logs
+      - huggingface_cache:/home/nlpuser/.cache/huggingface
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7860/api/predict"]
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s
     profiles: ["ui"]
 
-  # Individual UIs (optional, can be launched separately if needed)
+  # Individual UIs (optional): docker compose --profile individual up sentiment qa
   sentiment:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-sentiment
-    command: python ui/sentiment_playground.py
+    command: python -m ui.sentiment_playground
     ports:
       - "7860:7860"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
-    profiles: ["individual"]  # Only run with --profile individual
+    profiles: ["individual"]
 
   qa:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-qa
-    command: python ui/qa_system.py
+    command: python -m ui.qa_system
     ports:
       - "7865:7865"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
+      - ./data:/app/data:ro
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
     profiles: ["individual"]
 
   generation:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-generation
-    command: python ui/generation_playground.py
+    command: python -m ui.generation_playground
     ports:
       - "7866:7866"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
     profiles: ["individual"]
 
   zero-shot:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-zero-shot
-    command: python ui/zero_shot_classifier.py
+    command: python -m ui.zero_shot_classifier
     ports:
       - "7867:7867"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
     profiles: ["individual"]
 
   translation:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-translation
-    command: python ui/translation_hub.py
+    command: python -m ui.translation_hub
     ports:
       - "7868:7868"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
+      - ./data:/app/data:ro
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
     profiles: ["individual"]
 
   vision:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app
     container_name: nlp-vision
-    command: python ui/vision_language_explorer.py
+    command: python -m ui.vision_language_explorer
     ports:
       - "7869:7869"
-    environment:
-      - PYTHONUNBUFFERED=1
+    environment: *ui-env
     volumes:
       - huggingface_cache:/home/nlpuser/.cache/huggingface
-    networks:
-      - nlp-network
     profiles: ["individual"]
 
 volumes:

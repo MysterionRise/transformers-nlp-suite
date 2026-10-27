@@ -1,56 +1,56 @@
-# Dockerfile for Customer Intelligence NLP Platform
-# Multi-stage build for optimized image size
+# Transformers NLP Suite image: runs the REST API by default, the demo UIs on request.
+#
+# Dependencies are installed into a virtualenv at /opt/venv, which is copied into
+# the runtime stage and readable by the unprivileged runtime user. (Installing with
+# `pip --user` as root put packages in /root/.local, which the runtime user cannot
+# read, so nothing could be imported.)
 
-# Stage 1: Builder
-FROM python:3.11-slim as builder
+# Stage 1: build the virtualenv
+FROM python:3.11-slim AS builder
 
-WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt requirements-dev.txt ./
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --user -r requirements.txt
+WORKDIR /build
+COPY requirements.txt ./
 
-# Stage 2: Runtime
+# CPU-only PyTorch first: the default index ships CUDA builds that add several GB
+# and are useless in this CPU image. requirements.txt then reuses this torch.
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --index-url https://download.pytorch.org/whl/cpu torch \
+    && pip install -r requirements.txt \
+    && python -m spacy download en_core_web_sm
+
+# Stage 2: runtime
 FROM python:3.11-slim
 
-WORKDIR /app
-
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgomp1 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 nlpuser
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /root/.local
+COPY --from=builder /opt/venv /opt/venv
 
-# Copy application code
-COPY . .
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-# Set Python path
-ENV PATH=/root/.local/bin:$PATH
-ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY --chown=nlpuser:nlpuser . .
 
-# Download spaCy model (for NER)
-RUN python -m spacy download en_core_web_sm || true
-
-# Create non-root user
-RUN useradd -m -u 1000 nlpuser && chown -R nlpuser:nlpuser /app
 USER nlpuser
 
-# Expose API and UI ports
-EXPOSE 8000 7860 7861 7862 7863 7864 7865 7866 7867 7868 7869
+# 8000: REST API. 7860: combined demo UI app (`python launch_ui.py all`).
+# Individual UIs use 7860-7869 (see ui/catalog.py).
+EXPOSE 8000 7860
 
-# Default command: run the API server for portfolio deployments
 CMD ["python", "launch_ui.py", "api", "--host", "0.0.0.0"]
