@@ -1,433 +1,416 @@
 """
-Model Performance Dashboard - Interactive UI for comparing model performance
+Evaluation Metrics - score generated text against a reference.
 
-Features:
-- Compare multiple models side-by-side
-- Evaluate outputs with multiple metrics (BLEU, ROUGE, METEOR, BERTScore)
-- Visualize performance across different metrics
-- Export results and charts
-- Manage model cache
+BLEU, ROUGE, METEOR and a bag-of-words cosine run locally with nltk and
+rouge-score. Their NLTK data is checked (and downloaded if possible) on the
+first evaluation, never at import. BERTScore is opt-in because its first use
+downloads roberta-large (~1.4 GB).
 """
 
-from typing import Dict, List, Tuple
+import json
+import math
+import re
+import sys
+import threading
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import gradio as gr
 import pandas as pd
 import plotly.graph_objects as go
 
-from config.settings import get_model_registry
-from utils import get_cache_info, get_logger
-from utils.error_handler import handle_errors
-
-logger = get_logger(__name__)
-
-# Import evaluation metrics
 try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/performance_dashboard.py`
+    import common as shell  # type: ignore[no-redef]
+
+logger = shell.get_logger(__name__)
+
+UI_KEY = "performance"
+
+NLTK_INSTALL_HINT = "python -m nltk.downloader punkt_tab wordnet"
+BERTSCORE_LABEL = "Also compute BERTScore (first use downloads roberta-large, about 1.4 GB; slow on CPU)"
+BERTSCORE_MAX_TOKENS = 510  # roberta-large: 512 positions minus <s> and </s>
+MAX_CANDIDATES = 20
+
+METRICS = ["BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L", "METEOR", "Cosine (bag of words)"]
+BERTSCORE_METRICS = ["BERTScore P", "BERTScore R", "BERTScore F1"]
+CHART_METRICS = ["BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L", "METEOR", "BERTScore F1"]
+_CANDIDATE_SEPARATOR = re.compile(r"(?m)^[ \t]*-{3,}[ \t]*$")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+_nltk_ready: Dict[str, bool] = {}
+_nltk_lock = threading.Lock()
+_scorer_lock = threading.Lock()
+_bert_scorer: Optional[Any] = None
+
+
+# --------------------------------------------------------------------------- NLTK data
+
+
+def _download_nltk(package: str) -> bool:
+    """Try to download one NLTK package; False when offline or refused (for example behind a proxy)."""
     import nltk
-    from bert_score import score as bert_score
-    from nltk.translate import meteor_score
-    from nltk.translate.bleu_score import sentence_bleu
-    from rouge_score import rouge_scorer
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    # Download required NLTK data
-    for resource in ["punkt_tab", "wordnet", "omw-1.4"]:
-        try:
-            nltk.download(resource, quiet=True)
-        except Exception:
-            pass
-
-    EVAL_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"Evaluation metrics not available: {e}")
-    EVAL_AVAILABLE = False
-
-
-@handle_errors(default_return={}, user_message="Failed to evaluate scores")
-def evaluate_text(reference: str, candidate: str) -> Dict:
-    """
-    Evaluate candidate text against reference using multiple metrics
-
-    Args:
-        reference: Reference/ground truth text
-        candidate: Generated/candidate text to evaluate
-
-    Returns:
-        Dictionary of evaluation scores
-    """
-    if not EVAL_AVAILABLE:
-        return {"error": "Evaluation libraries not installed"}
-
-    if not reference or not candidate:
-        return {"error": "Both reference and candidate text are required"}
 
     try:
-        reference_tokens = nltk.word_tokenize(reference)
-        candidate_tokens = nltk.word_tokenize(candidate)
-
-        # BLEU Score
-        bleu = sentence_bleu([reference_tokens], candidate_tokens)
-
-        # ROUGE Scores
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
-        rouge_scores = scorer.score(reference, candidate)
-
-        # METEOR Score
-        meteor = meteor_score.single_meteor_score(reference_tokens, candidate_tokens)
-
-        # Cosine Similarity
-        vectorizer = TfidfVectorizer().fit_transform([reference, candidate])
-        vectors = vectorizer.toarray()
-        cosine_sim = cosine_similarity(vectors)[0][1]
-
-        # BERTScore
-        P, R, F1 = bert_score([candidate], [reference], lang="en", verbose=False)
-
-        return {
-            "BLEU": round(bleu, 4),
-            "ROUGE-1": round(rouge_scores["rouge1"].fmeasure, 4),
-            "ROUGE-2": round(rouge_scores["rouge2"].fmeasure, 4),
-            "ROUGE-L": round(rouge_scores["rougeL"].fmeasure, 4),
-            "METEOR": round(meteor, 4),
-            "Cosine Similarity": round(cosine_sim, 4),
-            "BERTScore P": round(P.mean().item(), 4),
-            "BERTScore R": round(R.mean().item(), 4),
-            "BERTScore F1": round(F1.mean().item(), 4),
-        }
-    except Exception as e:
-        logger.error(f"Evaluation error: {e}")
-        return {"error": str(e)}
+        return bool(nltk.download(package, quiet=True, raise_on_error=False))
+    except Exception as exc:  # network and permission errors vary by platform
+        logger.warning(f"NLTK download of {package} failed: {exc}")
+        return False
 
 
-def create_comparison_chart(results: List[Dict]) -> go.Figure:
-    """
-    Create radar chart comparing multiple model results
+def _check_punkt() -> None:
+    import nltk
 
-    Args:
-        results: List of evaluation results with model names
+    nltk.data.find("tokenizers/punkt_tab/english/")
 
-    Returns:
-        Plotly figure
-    """
-    if not results:
-        return go.Figure()
 
-    # Define metrics to visualize
-    metrics = ["BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L", "METEOR", "BERTScore F1"]
+def _check_wordnet() -> None:
+    from nltk.corpus import wordnet
 
-    fig = go.Figure()
+    wordnet.synsets("test")  # loads the corpus (folder or zip) the way METEOR does
 
-    for result in results:
-        model_name = result.get("model", "Unknown")
-        values = [result.get(metric, 0) for metric in metrics]
 
-        fig.add_trace(
-            go.Scatterpolar(
-                r=values,
-                theta=metrics,
-                fill="toself",
-                name=model_name,
-            )
+# NLTK package -> check that raises LookupError when the data is missing.
+NLTK_CHECKS: Dict[str, Callable[[], None]] = {"punkt_tab": _check_punkt, "wordnet": _check_wordnet}
+
+
+def _nltk_installed(package: str) -> bool:
+    try:
+        NLTK_CHECKS[package]()
+        return True
+    except LookupError:
+        return False
+
+
+def nltk_data_available(package: str) -> bool:
+    """Whether NLTK data `package` is installed, downloading it on first use. Cached per process."""
+    with _nltk_lock:
+        if package not in _nltk_ready:
+            found = _nltk_installed(package)
+            if not found:
+                logger.info(f"NLTK data '{package}' not found; trying to download it")
+                found = _download_nltk(package) and _nltk_installed(package)
+            _nltk_ready[package] = found
+        return _nltk_ready[package]
+
+
+# --------------------------------------------------------------------------- metrics
+
+
+@dataclass
+class MetricTools:
+    """Metric callables prepared once per evaluation event."""
+
+    tokenize: Callable[[str], List[str]]
+    bleu: Callable[[List[str], List[str]], float]
+    rouge: Any
+    meteor: Optional[Callable[[List[str], List[str]], float]]
+
+
+def _tokenizer(nltk: Any) -> Callable[[str], List[str]]:
+    if nltk_data_available("punkt_tab"):
+        return nltk.word_tokenize
+    shell.warn(
+        "NLTK 'punkt_tab' data is not installed and could not be downloaded, so a simpler sentence splitter "
+        f"is used for BLEU and METEOR. Install it with: {NLTK_INSTALL_HINT}"
+    )
+
+    def tokenize(text: str) -> List[str]:
+        sentences = _SENTENCE_END.split(text)
+        return [token for sentence in sentences for token in nltk.word_tokenize(sentence, preserve_line=True)]
+
+    return tokenize
+
+
+def _bleu(nltk_bleu: Any) -> Callable[[List[str], List[str]], float]:
+    smoothing = nltk_bleu.SmoothingFunction().method1
+
+    def bleu(reference: List[str], candidate: List[str]) -> float:
+        order = max(1, min(4, len(reference), len(candidate)))  # very short texts use fewer n-gram orders
+        weights = tuple([1.0 / order] * order)
+        return float(nltk_bleu.sentence_bleu([reference], candidate, weights=weights, smoothing_function=smoothing))
+
+    return bleu
+
+
+def prepare_metrics() -> MetricTools:
+    """Import the metric libraries and check their NLTK data; warn about anything that has to be skipped."""
+    try:
+        import nltk
+        from nltk.translate import bleu_score
+        from rouge_score import rouge_scorer
+    except ImportError as exc:
+        shell.fail(f"Evaluation needs the nltk and rouge-score packages ({exc}). Install requirements.txt.")
+
+    meteor = None
+    if nltk_data_available("wordnet"):
+        from nltk.translate.meteor_score import single_meteor_score
+
+        meteor = single_meteor_score
+    else:
+        shell.warn(
+            "METEOR was skipped: NLTK 'wordnet' data is not installed and could not be downloaded. "
+            f"Install it with: {NLTK_INSTALL_HINT}"
         )
+    rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+    return MetricTools(tokenize=_tokenizer(nltk), bleu=_bleu(bleu_score), rouge=rouge, meteor=meteor)
 
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-        showlegend=True,
-        title="Model Performance Comparison (Radar Chart)",
-        height=500,
+
+def _cosine(reference: List[str], candidate: List[str]) -> float:
+    a = Counter(token.lower() for token in reference if token.isalnum())
+    b = Counter(token.lower() for token in candidate if token.isalnum())
+    norm = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+    return sum(a[token] * b[token] for token in a) / norm if norm else 0.0
+
+
+def _lexical_scores(reference: str, candidate: str, tools: MetricTools) -> Dict[str, float]:
+    reference_tokens, candidate_tokens = tools.tokenize(reference), tools.tokenize(candidate)
+    rouge = tools.rouge.score(reference, candidate)
+    scores = {
+        "BLEU": tools.bleu(reference_tokens, candidate_tokens),
+        "ROUGE-1": rouge["rouge1"].fmeasure,
+        "ROUGE-2": rouge["rouge2"].fmeasure,
+        "ROUGE-L": rouge["rougeL"].fmeasure,
+    }
+    if tools.meteor is not None:
+        scores["METEOR"] = float(tools.meteor(reference_tokens, candidate_tokens))
+    scores["Cosine (bag of words)"] = _cosine(reference_tokens, candidate_tokens)
+    return {name: round(float(value), 4) for name, value in scores.items()}
+
+
+def _get_bert_scorer() -> Any:
+    """roberta-large BERTScorer, loaded on the first BERTScore request and kept for the process."""
+    global _bert_scorer
+    with _scorer_lock:
+        if _bert_scorer is None:
+            try:
+                from bert_score import BERTScorer
+            except ImportError:
+                shell.fail("BERTScore needs the bert-score package. Install requirements.txt.")
+            shell.info("Loading BERTScore. Its first use downloads roberta-large (about 1.4 GB).")
+            try:
+                _bert_scorer = BERTScorer(lang="en", use_fast_tokenizer=True)
+            except Exception as exc:
+                shell.fail_from(exc, "Loading BERTScore (roberta-large)")
+        return _bert_scorer
+
+
+def bertscore(references: Sequence[str], candidates: Sequence[str]) -> List[Dict[str, float]]:
+    """BERTScore precision, recall and F1 for each (reference, candidate) pair."""
+    scorer = _get_bert_scorer()
+    tokenizer = getattr(scorer, "_tokenizer", None)
+    refs = [shell.clip_to_tokens(text, tokenizer, BERTSCORE_MAX_TOKENS, label="Reference") for text in references]
+    cands = [shell.clip_to_tokens(text, tokenizer, BERTSCORE_MAX_TOKENS, label="Candidate") for text in candidates]
+    try:
+        precision, recall, f1 = scorer.score(cands, refs)
+    except Exception as exc:
+        shell.fail_from(exc, "BERTScore")
+    return [
+        {"BERTScore P": round(float(p), 4), "BERTScore R": round(float(r), 4), "BERTScore F1": round(float(f), 4)}
+        for p, r, f in zip(precision.tolist(), recall.tolist(), f1.tolist())
+    ]
+
+
+def evaluate_text(reference: str, candidate: str, use_bertscore: bool = False) -> Dict[str, float]:
+    """Score one candidate against a reference. BERTScore only when `use_bertscore` is set."""
+    reference = shell.require_text(reference, "a reference text")
+    candidate = shell.require_text(candidate, "a candidate text")
+    tools = prepare_metrics()
+    try:
+        scores = _lexical_scores(reference, candidate, tools)
+    except Exception as exc:
+        shell.fail_from(exc, "Evaluation")
+    if use_bertscore:
+        scores.update(bertscore([reference], [candidate])[0])
+    return scores
+
+
+# --------------------------------------------------------------------------- charts
+
+
+def _chart_metrics(results: List[Dict[str, Any]]) -> List[str]:
+    return [metric for metric in CHART_METRICS if all(metric in result for result in results)]
+
+
+def score_bars(scores: Dict[str, float]) -> go.Figure:
+    names = list(reversed(scores))
+    fig = go.Figure(
+        go.Bar(
+            x=[scores[name] for name in names],
+            y=names,
+            orientation="h",
+            text=[f"{scores[name]:.3f}" for name in names],
+            textposition="auto",
+        )
     )
-
+    fig.update_layout(
+        xaxis=dict(range=[0, 1], title="Score"), height=80 + 40 * len(names), margin=dict(l=10, r=10, t=10, b=40)
+    )
     return fig
 
 
-def create_metric_bars(results: List[Dict]) -> go.Figure:
-    """
-    Create bar chart for metric comparison
-
-    Args:
-        results: List of evaluation results
-
-    Returns:
-        Plotly figure
-    """
-    if not results:
-        return go.Figure()
-
-    metrics = ["BLEU", "ROUGE-1", "ROUGE-L", "METEOR", "BERTScore F1"]
-    models = [r.get("model", f"Model {i + 1}") for i, r in enumerate(results)]
-
+def create_comparison_chart(results: List[Dict[str, Any]]) -> go.Figure:
+    """Radar chart of the metrics every candidate has."""
+    metrics = _chart_metrics(results)
     fig = go.Figure()
-
-    for metric in metrics:
-        values = [r.get(metric, 0) for r in results]
-        fig.add_trace(go.Bar(name=metric, x=models, y=values))
-
-    fig.update_layout(
-        barmode="group",
-        title="Metrics Comparison Across Models",
-        xaxis_title="Models",
-        yaxis_title="Score",
-        height=400,
-        yaxis=dict(range=[0, 1]),
-    )
-
+    for result in results:
+        values = [result[metric] for metric in metrics]
+        fig.add_trace(go.Scatterpolar(r=values + values[:1], theta=metrics + metrics[:1], name=result["candidate"]))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), showlegend=True, height=450)
     return fig
+
+
+def create_metric_bars(results: List[Dict[str, Any]]) -> go.Figure:
+    """Grouped bar chart: one group per candidate, one bar per metric."""
+    fig = go.Figure()
+    names = [result["candidate"] for result in results]
+    for metric in _chart_metrics(results):
+        fig.add_trace(go.Bar(name=metric, x=names, y=[result[metric] for result in results]))
+    fig.update_layout(barmode="group", yaxis=dict(range=[0, 1], title="Score"), height=400)
+    return fig
+
+
+# --------------------------------------------------------------------------- handlers
+
+
+def evaluate_single(reference: str, candidate: str, use_bertscore: bool) -> Tuple[Dict[str, float], go.Figure]:
+    """Single comparison tab: scores and a bar chart."""
+    scores = evaluate_text(reference, candidate, use_bertscore)
+    return scores, score_bars(scores)
+
+
+def split_candidates(text: Optional[str]) -> List[str]:
+    """Candidates separated by lines containing only ``---``, capped at MAX_CANDIDATES with a warning."""
+    marked = _CANDIDATE_SEPARATOR.sub("\x1e", (text or "").replace("\r\n", "\n"))
+    return shell.split_items(marked, "\x1e", max_items=MAX_CANDIDATES, what="one candidate text")
+
+
+def records_frame(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Results table for a list of score records."""
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records)
+    frame["text"] = frame["text"].map(lambda text: text if len(text) <= 100 else text[:97] + "...")
+    metrics = [name for name in METRICS + BERTSCORE_METRICS if name in frame.columns]
+    return frame[["candidate", "text", *metrics]]
 
 
 def batch_evaluate(
-    reference: str, candidates_text: str, delimiter: str = "\n---\n"
-) -> Tuple[pd.DataFrame, go.Figure, go.Figure]:
-    """
-    Evaluate multiple candidates against a reference
-
-    Args:
-        reference: Reference text
-        candidates_text: Text containing multiple candidates
-        delimiter: Delimiter to split candidates
-
-    Returns:
-        Tuple of (DataFrame, radar chart, bar chart)
-    """
-    if not reference or not candidates_text:
-        return pd.DataFrame(), go.Figure(), go.Figure()
-
-    candidates = [c.strip() for c in candidates_text.split(delimiter) if c.strip()]
-
-    results = []
-    for i, candidate in enumerate(candidates):
-        scores = evaluate_text(reference, candidate)
-        if "error" not in scores:
-            scores["model"] = f"Model {i + 1}"
-            scores["candidate"] = candidate[:100] + "..." if len(candidate) > 100 else candidate
-            results.append(scores)
-
-    if not results:
-        return pd.DataFrame(), go.Figure(), go.Figure()
-
-    df = pd.DataFrame(results)
-
-    # Reorder columns
-    cols = [
-        "model",
-        "candidate",
-        "BLEU",
-        "ROUGE-1",
-        "ROUGE-2",
-        "ROUGE-L",
-        "METEOR",
-        "BERTScore F1",
-    ]
-    df = df[[col for col in cols if col in df.columns]]
-
-    radar_chart = create_comparison_chart(results)
-    bar_chart = create_metric_bars(results)
-
-    return df, radar_chart, bar_chart
+    reference: str, candidates_text: str, use_bertscore: bool = False
+) -> Tuple[pd.DataFrame, go.Figure, go.Figure, List[Dict[str, Any]]]:
+    """Score several candidates; returns the table, radar chart, bar chart and records for export."""
+    reference = shell.require_text(reference, "a reference text")
+    candidates = split_candidates(candidates_text)
+    tools = prepare_metrics()
+    records: List[Dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, 1):
+        try:
+            scores = _lexical_scores(reference, candidate, tools)
+        except Exception as exc:
+            shell.fail_from(exc, f"Evaluating candidate {index}")
+        records.append({"candidate": f"Candidate {index}", "text": candidate, **scores})
+    if use_bertscore:
+        for record, extra in zip(records, bertscore([reference] * len(candidates), candidates)):
+            record.update(extra)
+    return records_frame(records), create_comparison_chart(records), create_metric_bars(records), records
 
 
-def get_cache_stats() -> str:
-    """Get formatted cache statistics"""
-    try:
-        stats = get_cache_info()
-        return f"""### Cache Statistics
-
-**Cached Models:** {stats["cached_models"]} / {stats["max_size"]}
-**Device:** {stats["device"]}
-
-**Loaded Models:**
-{chr(10).join(f"- {model}" for model in stats.get("models", [])) if stats.get("models") else "No models loaded"}
-"""
-    except Exception as e:
-        return f"Error getting cache stats: {str(e)}"
+def export_results(records: Optional[List[Dict[str, Any]]]) -> str:
+    """JSON export of the latest batch comparison."""
+    if not records:
+        shell.fail("Run a batch comparison first; its results are exported here.")
+    return json.dumps(records, indent=2, ensure_ascii=False)
 
 
-def list_available_models() -> str:
-    """List all available models by category"""
-    try:
-        registry = get_model_registry()
-        categories = registry.list_categories()
-
-        output = ["### Available Models\n"]
-        for category in categories:
-            models = registry.get_category(category)
-            output.append(f"\n**{category.replace('_', ' ').title()}:**")
-            for key, config in models.items():
-                output.append(f"- {config.name} (`{config.model_id}`)")
-
-        return "\n".join(output)
-    except Exception as e:
-        return f"Error listing models: {str(e)}"
-
-
-def export_results(df: pd.DataFrame) -> str:
-    """Export results to JSON"""
-    if df.empty:
-        return "{}"
-    return df.to_json(orient="records", indent=2)
-
-
-# Example texts
 EXAMPLE_REFERENCE = (
     "The investment strategy involves diversifying assets across various sectors to "
     "mitigate risks and maximize returns. This approach ensures a balanced portfolio "
     "that can withstand market volatility while providing steady growth opportunities."
 )
-
-EXAMPLE_CANDIDATE_1 = (
+EXAMPLE_CANDIDATES = [
     "The strategy for investments involves diversifying assets across multiple sectors "
     "to minimize risks and optimize returns. This method ensures a balanced portfolio "
-    "that can handle market fluctuations while offering consistent growth opportunities."
-)
-
-EXAMPLE_CANDIDATE_2 = (
+    "that can handle market fluctuations while offering consistent growth opportunities.",
     "An investment approach focuses on spreading assets across different sectors to "
     "reduce risk and increase profits. This strategy creates a stable portfolio "
-    "resistant to market changes and provides continuous growth potential."
-)
-
-EXAMPLE_CANDIDATE_3 = (
+    "resistant to market changes and provides continuous growth potential.",
     "The financial plan includes asset diversification across various industries to "
     "lower risks and enhance returns. This ensures portfolio balance and resilience "
-    "against market volatility with sustainable growth prospects."
-)
+    "against market volatility with sustainable growth prospects.",
+]
+
+ABOUT = f"""
+All scores run from 0 to 1; higher means the candidate is closer to the reference.
+
+- **BLEU**: n-gram precision (up to 4-grams, smoothed) with a brevity penalty. Strict about exact wording.
+- **ROUGE-1 / ROUGE-2 / ROUGE-L**: F1 of shared words, word pairs and the longest common subsequence
+  (with stemming). The rouge-score tokenizer only keeps the letters a-z and digits, so use it for English.
+- **METEOR**: word alignment that also accepts stems and WordNet synonyms. Needs NLTK's `wordnet` data and is
+  skipped with a warning when that data is missing.
+- **Cosine (bag of words)**: cosine similarity of word counts, ignoring order.
+- **BERTScore** (opt-in): similarity of roberta-large contextual embeddings. Its first use downloads about
+  1.4 GB. Values are not rescaled, so even unrelated English texts usually score above 0.8.
+
+NLTK data (`punkt_tab`, `wordnet`) is checked on the first evaluation and downloaded when possible. Offline or
+behind a proxy that NLTK refuses, install it once with `{NLTK_INSTALL_HINT}`.
+
+**Batch:** put a line containing only `---` between candidates (up to {MAX_CANDIDATES}). The *Export* tab
+holds the latest batch results as JSON.
+"""
 
 
-def create_ui():
-    """Create the Performance Dashboard UI"""
+def create_ui() -> gr.Blocks:
+    """Build the evaluation page."""
+    with shell.page(UI_KEY) as demo:
+        results_state = gr.State([])
+        with gr.Tab("Single comparison"):
+            with gr.Row():
+                single_reference = gr.Textbox(label="Reference", lines=5, value=EXAMPLE_REFERENCE)
+                single_candidate = gr.Textbox(label="Candidate", lines=5, value=EXAMPLE_CANDIDATES[0])
+            single_bertscore = gr.Checkbox(label=BERTSCORE_LABEL, value=False)
+            evaluate_btn = gr.Button("Evaluate", variant="primary")
+            with gr.Row():
+                scores_json = gr.JSON(label="Scores")
+                scores_chart = gr.Plot(label="Scores")
 
-    with gr.Blocks(title="Model Performance Dashboard", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 📊 Model Performance Dashboard
+        with gr.Tab("Batch comparison"):
+            batch_reference = gr.Textbox(label="Reference", lines=4, value=EXAMPLE_REFERENCE)
+            batch_candidates = gr.Textbox(
+                label=f"Candidates: put a line containing only --- between them (up to {MAX_CANDIDATES})",
+                lines=12,
+                value="\n---\n".join(EXAMPLE_CANDIDATES),
+                placeholder="First candidate\n---\nSecond candidate",
+            )
+            batch_bertscore = gr.Checkbox(label=BERTSCORE_LABEL, value=False)
+            batch_btn = gr.Button("Compare all", variant="primary")
+            batch_table = gr.Dataframe(label="Results", wrap=True, interactive=False)
+            with gr.Row():
+                radar_chart = gr.Plot(label="Radar chart")
+                bar_chart = gr.Plot(label="Metrics by candidate")
 
-        Compare and evaluate model outputs using multiple metrics including BLEU, ROUGE, METEOR, and BERTScore.
-        """)
+        with gr.Tab("Export"):
+            gr.Markdown("Results of the latest batch comparison. Run one in the *Batch comparison* tab first.")
+            export_table = gr.Dataframe(label="Latest batch results", wrap=True, interactive=False)
+            export_btn = gr.Button("Generate JSON export", variant="primary")
+            export_output = gr.Code(label="JSON", language="json")
 
-        with gr.Tabs():
-            # Tab 1: Single Comparison
-            with gr.Tab("Single Comparison"):
-                gr.Markdown("### Compare Two Texts")
+        shell.about(ABOUT)
 
-                with gr.Row():
-                    with gr.Column():
-                        ref_input = gr.Textbox(
-                            label="Reference Text",
-                            placeholder="Enter the reference/ground truth text...",
-                            lines=5,
-                            value=EXAMPLE_REFERENCE,
-                        )
-                    with gr.Column():
-                        cand_input = gr.Textbox(
-                            label="Candidate Text",
-                            placeholder="Enter the candidate/generated text...",
-                            lines=5,
-                            value=EXAMPLE_CANDIDATE_1,
-                        )
-
-                eval_btn = gr.Button("Evaluate", variant="primary", size="lg")
-
-                with gr.Row():
-                    with gr.Column():
-                        scores_json = gr.JSON(label="Evaluation Scores")
-                    with gr.Column():
-                        scores_md = gr.Markdown(label="Formatted Scores")
-
-                def format_scores(scores):
-                    if "error" in scores:
-                        return f"**Error:** {scores['error']}"
-
-                    md = "### Evaluation Results\n\n"
-                    md += "| Metric | Score |\n|--------|-------|\n"
-                    for metric, score in scores.items():
-                        md += f"| {metric} | {score:.4f} |\n"
-                    return md
-
-                eval_btn.click(
-                    fn=evaluate_text,
-                    inputs=[ref_input, cand_input],
-                    outputs=[scores_json],
-                ).then(fn=format_scores, inputs=[scores_json], outputs=[scores_md])
-
-            # Tab 2: Batch Comparison
-            with gr.Tab("Batch Comparison"):
-                gr.Markdown("""
-                ### Compare Multiple Candidates
-
-                Enter multiple candidate texts separated by `---` to compare them against a reference.
-                """)
-
-                batch_ref = gr.Textbox(
-                    label="Reference Text",
-                    lines=4,
-                    value=EXAMPLE_REFERENCE,
-                    placeholder="Enter reference text...",
-                )
-
-                batch_cands = gr.Textbox(
-                    label="Candidate Texts (separated by ---)",
-                    lines=10,
-                    value=f"{EXAMPLE_CANDIDATE_1}\n---\n{EXAMPLE_CANDIDATE_2}\n---\n{EXAMPLE_CANDIDATE_3}",
-                    placeholder="Enter multiple candidates separated by ---",
-                )
-
-                batch_delimiter = gr.Textbox(label="Delimiter", value="\n---\n", max_lines=1)
-
-                batch_btn = gr.Button("Compare All", variant="primary", size="lg")
-
-                results_table = gr.Dataframe(label="Results Table", wrap=True)
-
-                with gr.Row():
-                    radar_chart = gr.Plot(label="Radar Chart")
-                    bar_chart = gr.Plot(label="Bar Chart")
-
-                batch_btn.click(
-                    fn=batch_evaluate,
-                    inputs=[batch_ref, batch_cands, batch_delimiter],
-                    outputs=[results_table, radar_chart, bar_chart],
-                )
-
-            # Tab 3: Model Registry
-            with gr.Tab("Model Registry"):
-                gr.Markdown("### Available Models & Cache Status")
-
-                with gr.Row():
-                    refresh_btn = gr.Button("Refresh", size="sm")
-
-                with gr.Row():
-                    with gr.Column():
-                        cache_stats = gr.Markdown(value=get_cache_stats())
-                    with gr.Column():
-                        available_models = gr.Markdown(value=list_available_models())
-
-                refresh_btn.click(fn=get_cache_stats, outputs=[cache_stats]).then(
-                    fn=list_available_models, outputs=[available_models]
-                )
-
-            # Tab 4: Export
-            with gr.Tab("Export"):
-                gr.Markdown("### Export Evaluation Results")
-
-                export_input = gr.Dataframe(label="Results to Export (from Batch Comparison)")
-                export_btn = gr.Button("Generate JSON Export", variant="primary")
-                export_output = gr.Code(label="Exported JSON", language="json")
-
-                export_btn.click(fn=export_results, inputs=[export_input], outputs=[export_output])
-
-        gr.Markdown("""
-        ---
-        ### Metrics Explanation
-
-        - **BLEU**: Measures n-gram overlap (0-1, higher is better)
-        - **ROUGE-1/2/L**: Measures recall of unigrams, bigrams, and longest common subsequence
-        - **METEOR**: Considers synonyms and stemming (0-1, higher is better)
-        - **Cosine Similarity**: TF-IDF based similarity (0-1, higher is better)
-        - **BERTScore**: Contextual embeddings similarity (precision, recall, F1)
-        """)
-
+        evaluate_btn.click(
+            evaluate_single,
+            inputs=[single_reference, single_candidate, single_bertscore],
+            outputs=[scores_json, scores_chart],
+        )
+        batch_btn.click(
+            batch_evaluate,
+            inputs=[batch_reference, batch_candidates, batch_bertscore],
+            outputs=[batch_table, radar_chart, bar_chart, results_state],
+        ).success(records_frame, inputs=results_state, outputs=export_table)
+        export_btn.click(export_results, inputs=results_state, outputs=export_output)
     return demo
 
 
 if __name__ == "__main__":
-    logger.info("Starting Model Performance Dashboard")
-    demo = create_ui()
-    demo.launch(server_name="127.0.0.1", server_port=7864, share=False)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])

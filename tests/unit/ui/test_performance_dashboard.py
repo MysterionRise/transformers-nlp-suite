@@ -1,350 +1,202 @@
-"""
-Unit tests for performance dashboard evaluation functions
-"""
+"""Tests for the evaluation metrics UI (ui/performance_dashboard.py)."""
 
-from unittest.mock import MagicMock, patch
+import importlib
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import patch
 
+import gradio as gr
+import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import pytest
 
-# Try importing evaluation dependencies
-try:
-    from ui.performance_dashboard import (
-        EVAL_AVAILABLE,
-        batch_evaluate,
-        create_comparison_chart,
-        create_metric_bars,
-        evaluate_text,
-        export_results,
-        get_cache_stats,
-        list_available_models,
+from tests.unit.ui.conftest import FakeTokenizer
+from ui import performance_dashboard as ui
+
+REPO = Path(__file__).resolve().parents[3]
+REFERENCE = "The cat sat on the mat. It was very happy there."
+DIFFERENT = "A dog slept under the old wooden table all day."
+
+
+@pytest.fixture(autouse=True)
+def offline_nltk():
+    """Never download NLTK data in unit tests; each test starts with no cached availability."""
+    ui._nltk_ready.clear()
+    with patch.object(ui, "_download_nltk", return_value=False) as download:
+        yield download
+    ui._nltk_ready.clear()
+
+
+@pytest.fixture
+def without_wordnet():
+    ui._nltk_ready["wordnet"] = False
+
+
+class FakeScorer:
+    """Stands in for bert_score.BERTScorer: records inputs, returns fixed scores."""
+
+    def __init__(self):
+        self._tokenizer = FakeTokenizer(model_max_length=10_000)
+        self.calls = []
+
+    def score(self, cands, refs):
+        self.calls.append((list(cands), list(refs)))
+        n = len(cands)
+        return np.full(n, 0.91), np.full(n, 0.87), np.full(n, 0.89)
+
+
+def test_import_and_page_build_need_no_network():
+    import nltk
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("network access while importing or building the page")
+
+    with (
+        patch.object(nltk, "download", side_effect=no_network) as download,
+        patch.object(socket.socket, "connect", side_effect=no_network),
+    ):
+        module = importlib.reload(ui)
+        demo = module.create_ui()
+    download.assert_not_called()
+    assert demo.title.startswith("Evaluation Metrics")
+
+
+def test_imports_in_script_mode_from_the_ui_directory():
+    """`python ui/performance_dashboard.py` puts ui/ (not the repo root) on sys.path."""
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    code = "import performance_dashboard as m; m.create_ui(); print('built', m.UI_KEY)"
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=REPO / "ui", env=env, capture_output=True, text=True, timeout=300
     )
-
-    DASHBOARD_AVAILABLE = True
-except ImportError:
-    DASHBOARD_AVAILABLE = False
-    pytestmark = pytest.mark.skip(reason="Performance dashboard dependencies not available")
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "built performance" in result.stdout
 
 
-@pytest.mark.skipif(not DASHBOARD_AVAILABLE, reason="Dashboard not available")
 class TestEvaluateText:
-    """Test evaluate_text function"""
+    def test_identical_text_scores_one(self):
+        scores = ui.evaluate_text(REFERENCE, REFERENCE)
+        assert scores["BLEU"] == 1.0
+        assert scores["ROUGE-1"] == scores["ROUGE-2"] == scores["ROUGE-L"] == 1.0
+        assert scores["Cosine (bag of words)"] == 1.0
 
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_evaluate_text_basic(self):
-        """Test basic text evaluation"""
-        reference = "The cat sat on the mat."
-        candidate = "The cat sat on the mat."
+    def test_different_text_scores_lower(self):
+        same = ui.evaluate_text(REFERENCE, REFERENCE)
+        scores = ui.evaluate_text(REFERENCE, DIFFERENT)
+        assert 0.0 < scores["ROUGE-L"] < 1.0
+        assert scores["ROUGE-L"] < same["ROUGE-L"]
+        assert scores["BLEU"] < 0.2
+        assert scores["Cosine (bag of words)"] < same["Cosine (bag of words)"]
 
-        result = evaluate_text(reference, candidate)
+    def test_meteor_is_skipped_with_a_warning_when_wordnet_is_missing(self, without_wordnet):
+        with pytest.warns(UserWarning, match="METEOR was skipped"):
+            scores = ui.evaluate_text(REFERENCE, REFERENCE)
+        assert "METEOR" not in scores
+        assert scores["BLEU"] == 1.0 and scores["ROUGE-L"] == 1.0
 
-        assert isinstance(result, dict)
-        # Perfect match should have high scores
-        if "BLEU" in result:
-            assert result["BLEU"] > 0.9
+    def test_meteor_is_computed_when_wordnet_is_available(self):
+        ui._nltk_ready["wordnet"] = True
+        with patch("nltk.translate.meteor_score.single_meteor_score", return_value=0.4242) as meteor:
+            scores = ui.evaluate_text("The cat sat.", "A cat sat.")
+        assert scores["METEOR"] == 0.4242
+        reference_tokens, candidate_tokens = meteor.call_args.args
+        assert reference_tokens == ["The", "cat", "sat", "."]
+        assert candidate_tokens == ["A", "cat", "sat", "."]
 
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_evaluate_text_different_texts(self):
-        """Test evaluation with different texts"""
-        reference = "The quick brown fox jumps over the lazy dog."
-        candidate = "A fast brown fox leaps over a sleepy dog."
+    def test_missing_punkt_falls_back_to_a_simple_tokenizer_with_a_warning(self, without_wordnet):
+        ui._nltk_ready["punkt_tab"] = False
+        with pytest.warns(UserWarning, match="punkt_tab"):
+            tools = ui.prepare_metrics()
+        assert tools.tokenize("The cat sat. It slept!") == ["The", "cat", "sat", ".", "It", "slept", "!"]
+        assert tools.meteor is None
 
-        result = evaluate_text(reference, candidate)
+    def test_nltk_download_is_attempted_once_per_process(self, offline_nltk):
+        with patch.object(ui, "_nltk_installed", return_value=False):
+            ui.evaluate_text(REFERENCE, DIFFERENT)
+            ui.evaluate_text(REFERENCE, REFERENCE)
+        assert sorted(call.args[0] for call in offline_nltk.call_args_list) == ["punkt_tab", "wordnet"]
 
-        assert isinstance(result, dict)
-        # Should have lower scores than perfect match
-        if "BLEU" in result:
-            assert result["BLEU"] < 1.0
+    def test_bertscore_only_when_requested(self):
+        with patch.object(ui, "bertscore", return_value=[{"BERTScore F1": 0.88}]) as bertscore:
+            scores = ui.evaluate_text(REFERENCE, DIFFERENT)
+            assert not any(name.startswith("BERTScore") for name in scores)
+            bertscore.assert_not_called()
 
-    def test_evaluate_text_empty_reference(self):
-        """Test evaluation with empty reference"""
-        result = evaluate_text("", "Some text")
+            scores = ui.evaluate_text(REFERENCE, DIFFERENT, use_bertscore=True)
+        bertscore.assert_called_once_with([REFERENCE], [DIFFERENT])
+        assert scores["BERTScore F1"] == 0.88
 
-        assert isinstance(result, dict)
-        assert "error" in result
-
-    def test_evaluate_text_empty_candidate(self):
-        """Test evaluation with empty candidate"""
-        result = evaluate_text("Some text", "")
-
-        assert isinstance(result, dict)
-        assert "error" in result
-
-    def test_evaluate_text_both_empty(self):
-        """Test evaluation with both texts empty"""
-        result = evaluate_text("", "")
-
-        assert isinstance(result, dict)
-        assert "error" in result
-
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_evaluate_text_metrics_present(self):
-        """Test that all expected metrics are present"""
-        reference = "The cat sat on the mat."
-        candidate = "The cat sat on the mat."
-
-        result = evaluate_text(reference, candidate)
-
-        if "error" not in result:
-            # Check for expected metrics
-            expected_metrics = ["BLEU", "ROUGE-1", "ROUGE-L", "METEOR"]
-            for metric in expected_metrics:
-                assert metric in result or "error" in result
-
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_evaluate_text_score_range(self):
-        """Test that scores are in valid range [0, 1]"""
-        reference = "The cat sat on the mat."
-        candidate = "The dog stood on the rug."
-
-        result = evaluate_text(reference, candidate)
-
-        if "error" not in result:
-            for key, value in result.items():
-                if isinstance(value, (int, float)):
-                    assert 0 <= value <= 1, f"Score {key}={value} is out of range [0, 1]"
+    def test_empty_inputs_are_friendly_errors(self):
+        with pytest.raises(gr.Error, match="reference"):
+            ui.evaluate_text("  ", "text")
+        with pytest.raises(gr.Error, match="candidate"):
+            ui.evaluate_text("text", "")
 
 
-@pytest.mark.skipif(not DASHBOARD_AVAILABLE, reason="Dashboard not available")
-class TestChartCreation:
-    """Test chart creation functions"""
+class TestBertScore:
+    def test_scores_and_clipping_to_the_model_limit(self):
+        scorer = FakeScorer()
+        long_candidate = " ".join(f"w{i}" for i in range(ui.BERTSCORE_MAX_TOKENS + 40))
+        with patch.object(ui, "_get_bert_scorer", return_value=scorer):
+            with pytest.warns(UserWarning, match=f"only the first {ui.BERTSCORE_MAX_TOKENS} were used"):
+                results = ui.bertscore(["short reference"], [long_candidate])
+        assert results == [{"BERTScore P": 0.91, "BERTScore R": 0.87, "BERTScore F1": 0.89}]
+        cands, refs = scorer.calls[0]
+        assert refs == ["short reference"]
+        assert len(cands[0].split()) == ui.BERTSCORE_MAX_TOKENS
 
-    def test_create_comparison_chart_empty(self):
-        """Test creating chart with empty results"""
-        fig = create_comparison_chart([])
-
-        assert isinstance(fig, go.Figure)
-
-    def test_create_comparison_chart_single_model(self):
-        """Test creating chart with single model"""
-        results = [
-            {
-                "model": "Model 1",
-                "BLEU": 0.8,
-                "ROUGE-1": 0.75,
-                "ROUGE-2": 0.6,
-                "ROUGE-L": 0.7,
-                "METEOR": 0.65,
-                "BERTScore F1": 0.85,
-            }
-        ]
-
-        fig = create_comparison_chart(results)
-
-        assert isinstance(fig, go.Figure)
-        assert len(fig.data) == 1
-
-    def test_create_comparison_chart_multiple_models(self):
-        """Test creating chart with multiple models"""
-        results = [
-            {
-                "model": "Model 1",
-                "BLEU": 0.8,
-                "ROUGE-1": 0.75,
-                "ROUGE-2": 0.6,
-                "ROUGE-L": 0.7,
-                "METEOR": 0.65,
-                "BERTScore F1": 0.85,
-            },
-            {
-                "model": "Model 2",
-                "BLEU": 0.7,
-                "ROUGE-1": 0.65,
-                "ROUGE-2": 0.5,
-                "ROUGE-L": 0.6,
-                "METEOR": 0.55,
-                "BERTScore F1": 0.75,
-            },
-        ]
-
-        fig = create_comparison_chart(results)
-
-        assert isinstance(fig, go.Figure)
-        assert len(fig.data) == 2
-
-    def test_create_metric_bars_empty(self):
-        """Test creating bar chart with empty results"""
-        fig = create_metric_bars([])
-
-        assert isinstance(fig, go.Figure)
-
-    def test_create_metric_bars_single_model(self):
-        """Test creating bar chart with single model"""
-        results = [
-            {"model": "Model 1", "BLEU": 0.8, "ROUGE-1": 0.75, "ROUGE-L": 0.7, "METEOR": 0.65, "BERTScore F1": 0.85}
-        ]
-
-        fig = create_metric_bars(results)
-
-        assert isinstance(fig, go.Figure)
-
-    def test_create_metric_bars_multiple_models(self):
-        """Test creating bar chart with multiple models"""
-        results = [
-            {"model": "Model 1", "BLEU": 0.8, "ROUGE-1": 0.75, "ROUGE-L": 0.7, "METEOR": 0.65, "BERTScore F1": 0.85},
-            {"model": "Model 2", "BLEU": 0.7, "ROUGE-1": 0.65, "ROUGE-L": 0.6, "METEOR": 0.55, "BERTScore F1": 0.75},
-        ]
-
-        fig = create_metric_bars(results)
-
-        assert isinstance(fig, go.Figure)
+    def test_checkboxes_are_off_by_default_and_state_the_download(self):
+        demo = ui.create_ui()
+        boxes = [block for block in demo.blocks.values() if isinstance(block, gr.Checkbox)]
+        assert len(boxes) == 2
+        assert all(box.value is False and "1.4 GB" in box.label for box in boxes)
 
 
-@pytest.mark.skipif(not DASHBOARD_AVAILABLE, reason="Dashboard not available")
-class TestBatchEvaluate:
-    """Test batch_evaluate function"""
+class TestBatch:
+    def test_separator_lines(self):
+        text = "first\n---\nsecond\n  ----  \r\nthird\n---\n\nnot --- a separator"
+        assert ui.split_candidates(text) == ["first", "second", "third", "not --- a separator"]
 
-    def test_batch_evaluate_empty_reference(self):
-        """Test batch evaluation with empty reference"""
-        df, radar, bar = batch_evaluate("", "candidate1\n---\ncandidate2")
+    def test_candidate_count_is_capped(self):
+        text = "\n---\n".join(f"candidate {i}" for i in range(ui.MAX_CANDIDATES + 5))
+        with pytest.warns(UserWarning, match=f"Only the first {ui.MAX_CANDIDATES}"):
+            assert len(ui.split_candidates(text)) == ui.MAX_CANDIDATES
 
+    def test_results_charts_and_export_records(self, without_wordnet):
+        df, radar, bars, records = ui.batch_evaluate(REFERENCE, f"{REFERENCE}\n---\n{DIFFERENT}")
         assert isinstance(df, pd.DataFrame)
-        assert isinstance(radar, go.Figure)
-        assert isinstance(bar, go.Figure)
-        assert len(df) == 0
+        assert df["candidate"].tolist() == ["Candidate 1", "Candidate 2"]
+        assert df["BLEU"].tolist()[0] == 1.0 and df["BLEU"].tolist()[1] < 0.2
+        assert "METEOR" not in df.columns  # skipped metrics are not shown as zeros
+        assert [record["text"] for record in records] == [REFERENCE, DIFFERENT]
+        assert list(radar.data[0].theta[:-1]) == ["BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L"]
+        assert [trace.name for trace in bars.data] == ["BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L"]
 
-    def test_batch_evaluate_empty_candidates(self):
-        """Test batch evaluation with empty candidates"""
-        df, radar, bar = batch_evaluate("reference text", "")
+        exported = json.loads(ui.export_results(records))
+        assert exported == records
 
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 0
+    def test_batch_bertscore_scores_every_candidate_in_one_call(self, without_wordnet):
+        scorer = FakeScorer()
+        with patch.object(ui, "_get_bert_scorer", return_value=scorer):
+            df, _, bars, _ = ui.batch_evaluate(REFERENCE, "one\n---\ntwo", use_bertscore=True)
+        assert scorer.calls == [(["one", "two"], [REFERENCE, REFERENCE])]
+        assert df["BERTScore F1"].tolist() == [0.89, 0.89]
+        assert "BERTScore F1" in [trace.name for trace in bars.data]
 
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_batch_evaluate_single_candidate(self):
-        """Test batch evaluation with single candidate"""
-        reference = "The cat sat on the mat."
-        candidate = "The cat sat on the mat."
+    def test_export_needs_a_batch_run(self):
+        with pytest.raises(gr.Error, match="Run a batch comparison first"):
+            ui.export_results([])
 
-        df, radar, bar = batch_evaluate(reference, candidate)
-
-        assert isinstance(df, pd.DataFrame)
-        if len(df) > 0:
-            assert "model" in df.columns
-            assert len(df) == 1
-
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_batch_evaluate_multiple_candidates(self):
-        """Test batch evaluation with multiple candidates"""
-        reference = "The cat sat on the mat."
-        candidates = "The cat sat on the mat.\n---\nThe dog stood on the rug."
-
-        df, radar, bar = batch_evaluate(reference, candidates)
-
-        assert isinstance(df, pd.DataFrame)
-        if len(df) > 0:
-            assert len(df) <= 2  # May be less if evaluation fails
-
-    def test_batch_evaluate_custom_delimiter(self):
-        """Test batch evaluation with custom delimiter"""
-        reference = "The cat sat on the mat."
-        candidates = "Candidate 1|||Candidate 2"
-
-        df, radar, bar = batch_evaluate(reference, candidates, delimiter="|||")
-
-        assert isinstance(df, pd.DataFrame)
-
-
-@pytest.mark.skipif(not DASHBOARD_AVAILABLE, reason="Dashboard not available")
-class TestUtilityFunctions:
-    """Test utility functions"""
-
-    def test_export_results_empty(self):
-        """Test exporting empty results"""
-        df = pd.DataFrame()
-        result = export_results(df)
-
-        assert result == "{}"
-
-    def test_export_results_with_data(self):
-        """Test exporting results with data"""
-        df = pd.DataFrame([{"model": "Model 1", "score": 0.8}])
-        result = export_results(df)
-
-        assert isinstance(result, str)
-        assert "Model 1" in result
-        assert "0.8" in result
-
-    @patch("ui.performance_dashboard.get_cache_info")
-    def test_get_cache_stats(self, mock_get_info):
-        """Test getting cache statistics"""
-        mock_get_info.return_value = {
-            "cached_models": 2,
-            "max_size": 3,
-            "device": "cpu",
-            "models": ["model1", "model2"],
-        }
-
-        result = get_cache_stats()
-
-        assert isinstance(result, str)
-        assert "2" in result
-        assert "3" in result
-        assert "cpu" in result
-
-    @patch("ui.performance_dashboard.get_cache_info")
-    def test_get_cache_stats_error(self, mock_get_info):
-        """Test cache stats with error"""
-        mock_get_info.side_effect = Exception("Test error")
-
-        result = get_cache_stats()
-
-        assert isinstance(result, str)
-        assert "Error" in result or "error" in result
-
-    @patch("ui.performance_dashboard.get_model_registry")
-    def test_list_available_models(self, mock_registry):
-        """Test listing available models"""
-        mock_reg = MagicMock()
-        mock_reg.list_categories.return_value = ["sentiment_analysis"]
-
-        mock_config = MagicMock()
-        mock_config.name = "Test Model"
-        mock_config.model_id = "test/model"
-
-        mock_reg.get_category.return_value = {"test_model": mock_config}
-        mock_registry.return_value = mock_reg
-
-        result = list_available_models()
-
-        assert isinstance(result, str)
-        assert "Available Models" in result or "sentiment" in result.lower()
-
-    @patch("ui.performance_dashboard.get_model_registry")
-    def test_list_available_models_error(self, mock_registry):
-        """Test listing models with error"""
-        mock_registry.side_effect = Exception("Test error")
-
-        result = list_available_models()
-
-        assert isinstance(result, str)
-        assert "Error" in result or "error" in result
-
-
-@pytest.mark.skipif(not DASHBOARD_AVAILABLE, reason="Dashboard not available")
-class TestIntegration:
-    """Integration tests for dashboard functions"""
-
-    @pytest.mark.skipif(not EVAL_AVAILABLE, reason="Evaluation libraries not available")
-    def test_full_evaluation_pipeline(self):
-        """Test complete evaluation pipeline"""
-        reference = "The quick brown fox jumps over the lazy dog."
-        candidate = "A fast brown fox leaps over a sleepy dog."
-
-        # Single evaluation
-        scores = evaluate_text(reference, candidate)
-        assert isinstance(scores, dict)
-
-        # Batch evaluation
-        candidates = f"{candidate}\n---\n{reference}"
-        df, radar, bar = batch_evaluate(reference, candidates)
-
-        assert isinstance(df, pd.DataFrame)
-        assert isinstance(radar, go.Figure)
-        assert isinstance(bar, go.Figure)
-
-        # Export
-        if not df.empty:
-            exported = export_results(df)
-            assert isinstance(exported, str)
+    def test_export_tab_is_linked_to_batch_results(self):
+        demo = ui.create_ui()
+        events = list(demo.fns.values())
+        batch = next(event for event in events if event.fn is ui.batch_evaluate)
+        export = next(event for event in events if event.fn is ui.export_results)
+        preview = next(event for event in events if event.fn is ui.records_frame)
+        state = export.inputs[0]
+        assert isinstance(state, gr.State)
+        assert any(output is state for output in batch.outputs)
+        assert preview.inputs[0] is state and isinstance(preview.outputs[0], gr.Dataframe)

@@ -1,515 +1,313 @@
 """
-Translation Hub - Interactive UI for multi-language translation
+Translation - translate text with Helsinki OPUS-MT pair models or mBART-50.
 
-Features:
-- Multi-language translation support
-- Multiple model options (mBART, Helsinki OPUS)
-- Real-time translation
-- Batch processing support
-- Language detection
+Models come from the ``translation`` registry category and load through the
+shared model cache. Helsinki OPUS-MT (the default) is one small model per
+language pair: the registry entry is the en-es model and lists the other
+supported pairs, which load by id (``Helsinki-NLP/opus-mt-{pair}``). mBART-50
+is one large multilingual model (~2.4 GB) that takes the source and target
+language codes on every call.
 """
 
-import logging
-from typing import Dict
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gradio as gr
-from transformers import pipeline
+import pandas as pd
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/translation_hub.py`
+    import common as shell  # type: ignore[no-redef]
 
-# Language codes and names for mBART
-MBARTLANGUAGES = {
-    "English": "en_XX",
-    "Spanish": "es_XX",
-    "French": "fr_XX",
-    "German": "de_DE",
-    "Italian": "it_IT",
-    "Portuguese": "pt_XX",
-    "Russian": "ru_RU",
-    "Chinese": "zh_CN",
-    "Japanese": "ja_XX",
-    "Korean": "ko_KR",
-    "Arabic": "ar_AR",
-    "Hindi": "hi_IN",
+logger = shell.get_logger(__name__)
+
+UI_KEY = "translation"
+MODELS = shell.ModelMenu("translation", keys=["helsinki_opus", "mbart_50"], default="helsinki_opus")
+HELSINKI_KEY = "helsinki_opus"
+MBART_KEY = "mbart_50"
+MBART_NOTICE = "mBART-50 is loading. Its first use downloads about 2.4 GB, which can take several minutes."
+
+# Display name -> (ISO 639-1 code used by OPUS-MT model ids, mBART-50 language code).
+LANGUAGES: Dict[str, Tuple[str, str]] = {
+    "English": ("en", "en_XX"),
+    "Spanish": ("es", "es_XX"),
+    "French": ("fr", "fr_XX"),
+    "German": ("de", "de_DE"),
+    "Italian": ("it", "it_IT"),
+    "Portuguese": ("pt", "pt_XX"),
+    "Russian": ("ru", "ru_RU"),
+    "Chinese": ("zh", "zh_CN"),
+    "Japanese": ("ja", "ja_XX"),
+    "Korean": ("ko", "ko_KR"),
+    "Arabic": ("ar", "ar_AR"),
+    "Hindi": ("hi", "hi_IN"),
 }
+LANGUAGE_NAMES = {iso: name for name, (iso, _) in LANGUAGES.items()}
 
-# Language pairs for Helsinki OPUS
-HELSINKI_LANGUAGE_PAIRS = [
-    "en-es",
-    "en-fr",
-    "en-de",
-    "es-en",
-    "fr-en",
-    "de-en",
-    "en-pt",
-    "pt-en",
-    "en-it",
-    "it-en",
-]
+MAX_NEW_TOKENS = 512
+BATCH_COLUMNS = ["#", "Original", "Translation"]
+SAMPLES_FILE = Path(__file__).resolve().parent.parent / "data" / "translation_samples.txt"
+_SAMPLE_HEADER = re.compile(r"^Sample\s+(\d+)\s*\(\s*(\w+)\s+to\s+(\w+)\s*\):?$", re.IGNORECASE)
+_SEPARATOR = re.compile(r"(?m)^\s*-{3,}\s*$")
 
-# Translation models
-TRANSLATION_MODELS = {
-    "mBART-50 (50+ languages)": "mbart",
-    "Helsinki OPUS (specific pairs)": "helsinki",
-}
-
-# Cache for loaded models
-model_cache = {}
+# Models announced with a "first use downloads..." toast in this process.
+_announced: Set[str] = set()
 
 
-def load_mbart_model():
-    """Load mBART translation model"""
-    if "mbart" not in model_cache:
-        logger.info("Loading mBART model...")
+# --------------------------------------------------------------------------- languages and models
+
+
+def helsinki_pairs() -> List[str]:
+    """OPUS-MT language pairs listed in the registry (for example "en-es")."""
+    config = MODELS.get(HELSINKI_KEY).config
+    return list(config.language_pairs or [config.model_id.rsplit("opus-mt-", 1)[-1]])
+
+
+def _pair_label(pair: str) -> str:
+    source, _, target = pair.partition("-")
+    return f"{LANGUAGE_NAMES.get(source, source)} → {LANGUAGE_NAMES.get(target, target)}"
+
+
+def _language(name: Optional[str], role: str) -> Tuple[str, str]:
+    if name not in LANGUAGES:
+        shell.fail(f"Choose a {role} language from the list.")
+    return LANGUAGES[name]
+
+
+def _load_helsinki(pair: str) -> Tuple[Any, str]:
+    """Pipeline and model id for one OPUS-MT pair; the registry entry serves its own pair."""
+    choice = MODELS.get(HELSINKI_KEY)
+    if choice.model_id.endswith(f"opus-mt-{pair}"):
+        return MODELS.load(choice.name), choice.model_id
+    model_id = f"Helsinki-NLP/opus-mt-{pair}"
+    return shell.load_by_id(model_id, "translation", action=f"Loading Helsinki OPUS-MT {pair}"), model_id
+
+
+def _resolve(model_name: str, source: str, target: str) -> Tuple[Any, Dict[str, str], str]:
+    """
+    Validate the request and load its model.
+
+    Returns the pipeline, the per-call language arguments and the model id.
+    """
+    choice = MODELS.get(model_name)
+    source_iso, source_code = _language(source, "source")
+    target_iso, target_code = _language(target, "target")
+    if source == target:
+        shell.fail("Source and target languages are the same. Pick two different languages.")
+
+    if choice.key == MBART_KEY:
+        if MBART_KEY not in _announced:
+            shell.info(MBART_NOTICE)
+        translator = MODELS.load(choice.name)
+        _announced.add(MBART_KEY)
+        return translator, {"src_lang": source_code, "tgt_lang": target_code}, choice.model_id
+
+    pair = f"{source_iso}-{target_iso}"
+    pairs = helsinki_pairs()
+    if pair not in pairs:
+        supported = ", ".join(_pair_label(p) for p in pairs)
+        shell.fail(
+            f"Helsinki OPUS-MT has no {source} → {target} model here. Supported pairs: {supported}. "
+            "Choose mBART-50 for other combinations."
+        )
+    translator, model_id = _load_helsinki(pair)
+    return translator, {}, model_id
+
+
+def _generate(translator: Any, text: str, lang_kwargs: Dict[str, str]) -> str:
+    """Translate one (already clipped) text. New tokens scale with the input, capped at MAX_NEW_TOKENS."""
+    budget = min(MAX_NEW_TOKENS, 3 * shell.count_tokens(translator.tokenizer, text) + 20)
+    result = translator(text, max_new_tokens=budget, **lang_kwargs)
+    return result[0]["translation_text"].strip()
+
+
+# --------------------------------------------------------------------------- handlers
+
+
+def translate(text: str, model_name: str, source_lang: str, target_lang: str) -> Tuple[str, Dict[str, Any]]:
+    """Translate one text; returns the translation and a details summary."""
+    text = shell.require_text(text, "some text to translate")
+    translator, lang_kwargs, model_id = _resolve(model_name, source_lang, target_lang)
+    used = shell.clip_for_model(text, translator, label="Text")
+    try:
+        translation = _generate(translator, used, lang_kwargs)
+    except Exception as exc:
+        shell.fail_from(exc, "Translation")
+
+    details = {
+        "model": MODELS.get(model_name).name,
+        "model_id": model_id,
+        "source": source_lang,
+        "target": target_lang,
+        "truncated": used != text,
+    }
+    return translation, details
+
+
+def _translate_rows(translator: Any, items: List[str], lang_kwargs: Dict[str, str]) -> Tuple[List[List], int, int]:
+    """Translate each line; a failing line is reported in its row. Returns rows, truncated and failed counts."""
+    limit = shell.token_limit(translator)
+    rows: List[List] = []
+    truncated = failed = 0
+    for index, item in enumerate(items, 1):
+        used, _ = shell.truncate_to_tokens(item, translator.tokenizer, limit)
+        truncated += used != item
         try:
-            model_cache["mbart"] = pipeline(
-                "translation",
-                model="facebook/mbart-large-50-many-to-many-mmt",
-            )
-            logger.info("mBART model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading mBART: {e}")
-            raise
-    return model_cache["mbart"]
+            rows.append([index, item, _generate(translator, used, lang_kwargs)])
+        except Exception as exc:
+            logger.warning(f"Batch line {index} failed: {exc}")
+            failed += 1
+            rows.append([index, item, f"error: {str(exc)[:120]}"])
+    return rows, truncated, failed
 
 
-def load_helsinki_model(lang_pair: str):
-    """Load Helsinki OPUS translation model for specific language pair"""
-    if lang_pair not in model_cache:
-        logger.info(f"Loading Helsinki OPUS model for {lang_pair}...")
-        try:
-            model_id = f"Helsinki-NLP/opus-mt-{lang_pair}"
-            model_cache[lang_pair] = pipeline(
-                "translation",
-                model=model_id,
-            )
-            logger.info(f"Helsinki model {lang_pair} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading Helsinki model for {lang_pair}: {e}")
-            raise
-    return model_cache[lang_pair]
+def batch_translate(text: str, model_name: str, source_lang: str, target_lang: str) -> Tuple[pd.DataFrame, str]:
+    """Translate one text per line with the selected model and languages."""
+    items = shell.split_items(text, what="one line of text to translate")
+    translator, lang_kwargs, _ = _resolve(model_name, source_lang, target_lang)
+    rows, truncated, failed = _translate_rows(translator, items, lang_kwargs)
+    if truncated:
+        shell.warn(f"{truncated} line(s) exceeded the model's token limit and were truncated.")
+
+    summary = f"{len(items) - failed} of {len(items)} lines translated from {source_lang} to {target_lang}"
+    summary += f" with {MODELS.get(model_name).name}."
+    if failed:
+        summary += f" {failed} line(s) failed; see the Translation column."
+    return pd.DataFrame(rows, columns=BATCH_COLUMNS), summary
 
 
-def translate_mbart(text: str, source_lang: str, target_lang: str) -> Dict:
+# --------------------------------------------------------------------------- samples
+
+
+def load_samples(path: Path = SAMPLES_FILE) -> Dict[str, Tuple[str, str, str]]:
     """
-    Translate using mBART model
+    Parse ``data/translation_samples.txt``: blocks separated by ``---`` lines, each
+    starting with a ``Sample N (Source to Target):`` header line.
 
-    Args:
-        text: Text to translate
-        source_lang: Source language name
-        target_lang: Target language name
-
-    Returns:
-        Dictionary with translation results
+    Returns {title: (text, source language, target language)}; blocks with an
+    unknown language or no text are skipped.
     """
-    if not text or not text.strip():
-        return {"error": "Please provide text to translate"}
-
     try:
-        translator = load_mbart_model()
-
-        # Get language codes
-        src_code = MBARTLANGUAGES.get(source_lang)
-        tgt_code = MBARTLANGUAGES.get(target_lang)
-
-        if not src_code or not tgt_code:
-            return {"error": "Language pair not supported"}
-
-        # Set source language
-        translator.tokenizer.src_lang = src_code
-
-        # Translate
-        result = translator(text, target_lang=tgt_code, max_length=400)
-
-        return {
-            "Original": text[:500] + ("..." if len(text) > 500 else ""),
-            "Translation": result[0]["translation_text"],
-            "Source Language": source_lang,
-            "Target Language": target_lang,
-            "Model": "mBART-50",
-            "Input Length": len(text),
-        }
-
-    except Exception as e:
-        logger.error(f"Error translating with mBART: {e}")
-        return {"error": f"Error: {str(e)}"}
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Translation samples not loaded: {exc}")
+        return {}
+    samples: Dict[str, Tuple[str, str, str]] = {}
+    for block in _SEPARATOR.split(raw):
+        header, _, body = block.strip().partition("\n")
+        match = _SAMPLE_HEADER.match(header.strip())
+        if not match or not body.strip():
+            continue
+        number, source, target = match.groups()
+        source, target = source.capitalize(), target.capitalize()
+        if source in LANGUAGES and target in LANGUAGES:
+            samples[f"Sample {number}: {source} → {target}"] = (body.strip(), source, target)
+    return samples
 
 
-def translate_helsinki(text: str, lang_pair: str) -> Dict:
-    """
-    Translate using Helsinki OPUS model
-
-    Args:
-        text: Text to translate
-        lang_pair: Language pair (e.g., 'en-es')
-
-    Returns:
-        Dictionary with translation results
-    """
-    if not text or not text.strip():
-        return {"error": "Please provide text to translate"}
-
-    try:
-        translator = load_helsinki_model(lang_pair)
-
-        # Translate
-        result = translator(text, max_length=400)
-
-        src_lang, tgt_lang = lang_pair.split("-")
-
-        return {
-            "Original": text[:500] + ("..." if len(text) > 500 else ""),
-            "Translation": result[0]["translation_text"],
-            "Source Language": src_lang.upper(),
-            "Target Language": tgt_lang.upper(),
-            "Model": "Helsinki OPUS",
-            "Language Pair": lang_pair,
-            "Input Length": len(text),
-        }
-
-    except Exception as e:
-        logger.error(f"Error translating with Helsinki: {e}")
-        return {"error": f"Error: {str(e)}"}
+SAMPLES = load_samples()
 
 
-def batch_translate(
-    batch_text: str,
-    model_choice: str,
-    source_lang: str = None,
-    target_lang: str = None,
-    lang_pair: str = None,
-) -> str:
-    """
-    Translate multiple texts
-
-    Args:
-        batch_text: Multiple texts separated by newlines
-        model_choice: Which model to use
-        source_lang: Source language for mBART
-        target_lang: Target language for mBART
-        lang_pair: Language pair for Helsinki
-
-    Returns:
-        Formatted results as string
-    """
-    if not batch_text or not batch_text.strip():
-        return "Please provide texts to translate"
-
-    try:
-        texts = [t.strip() for t in batch_text.split("\n") if t.strip()]
-
-        if not texts:
-            return "No valid texts found"
-
-        results = []
-
-        if model_choice == "mbart":
-            if not source_lang or not target_lang:
-                return "Please select source and target languages"
-
-            translator = load_mbart_model()
-            src_code = MBARTLANGUAGES.get(source_lang)
-            tgt_code = MBARTLANGUAGES.get(target_lang)
-            translator.tokenizer.src_lang = src_code
-
-            for i, text in enumerate(texts, 1):
-                try:
-                    result = translator(text, target_lang=tgt_code, max_length=400)
-                    orig_suffix = "..." if len(text) > 60 else ""
-                    trans_text = result[0]["translation_text"]
-                    trans_suffix = "..." if len(trans_text) > 80 else ""
-                    results.append(
-                        f"{i}. Original: {text[:60]}{orig_suffix}\n"
-                        f"   Translation: {trans_text[:80]}{trans_suffix}\n"
-                    )
-                except Exception as e:
-                    results.append(f"{i}. Error: {str(e)}\n")
-
-        else:  # helsinki
-            if not lang_pair:
-                return "Please select a language pair"
-
-            translator = load_helsinki_model(lang_pair)
-
-            for i, text in enumerate(texts, 1):
-                try:
-                    result = translator(text, max_length=400)
-                    orig_suffix = "..." if len(text) > 60 else ""
-                    trans_text = result[0]["translation_text"]
-                    trans_suffix = "..." if len(trans_text) > 80 else ""
-                    results.append(
-                        f"{i}. Original: {text[:60]}{orig_suffix}\n"
-                        f"   Translation: {trans_text[:80]}{trans_suffix}\n"
-                    )
-                except Exception as e:
-                    results.append(f"{i}. Error: {str(e)}\n")
-
-        return "\n".join(results)
-
-    except Exception as e:
-        logger.error(f"Error in batch translation: {e}")
-        return f"Error: {str(e)}"
+def use_sample(title: Optional[str]) -> Tuple[str, str, str]:
+    """Fill the text and language inputs from a sample."""
+    if title not in SAMPLES:
+        shell.fail("Choose a sample from the list.")
+    return SAMPLES[title]
 
 
-# Example texts for testing
-EXAMPLES = [
-    [
-        "Hello, how are you today? I hope you're having a great day!",
-        "English",
-        "Spanish",
-    ],
-    [
-        "The quick brown fox jumps over the lazy dog.",
-        "English",
-        "French",
-    ],
-    [
-        "Machine learning is a subset of artificial intelligence.",
-        "English",
-        "German",
-    ],
-]
+BATCH_EXAMPLE = (
+    "Where is the nearest train station?\n"
+    "The meeting has been moved to Thursday afternoon.\n"
+    "Please send me the invoice by email.\n"
+    "Our store opens at nine in the morning."
+)
+
+ABOUT = """
+**Helsinki OPUS-MT** (default) uses one small model (about 300 MB) per language pair, so it is fast but only
+covers the pairs listed below. **mBART-50** is a single multilingual model that translates between any two of
+the languages in the menus, but its first use downloads about 2.4 GB and it is slower on CPU.
+
+**How to use:** pick the model and languages, type or paste text (or load one of the samples from
+`data/translation_samples.txt`) and press *Translate*. The *Batch* tab translates one text per line with the
+model and languages selected in that tab.
+
+Neural translation can get names, numbers and technical terms wrong; check important translations.
+"""
 
 
-def create_ui():
-    """Create and configure the Gradio interface"""
+def _language_dropdowns(source: str = "English", target: str = "Spanish") -> Tuple[gr.Dropdown, gr.Dropdown]:
+    names = list(LANGUAGES)
+    return (
+        gr.Dropdown(choices=names, value=source, label="From"),
+        gr.Dropdown(choices=names, value=target, label="To"),
+    )
 
-    with gr.Blocks(title="Translation Hub", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-            # 🌍 Translation Hub
 
-            Translate text between multiple languages using state-of-the-art neural translation models.
-            Choose between multilingual mBART for 50+ languages or Helsinki OPUS for specific language pairs.
-            """)
+def _model_radio() -> gr.Radio:
+    return MODELS.radio(
+        info="Helsinki OPUS-MT: small, one model per pair. mBART-50: any pair below, ~2.4 GB download on first use."
+    )
 
+
+def create_ui() -> gr.Blocks:
+    """Build the translation page."""
+    pairs_note = "Helsinki OPUS-MT pairs: " + ", ".join(_pair_label(pair) for pair in helsinki_pairs()) + "."
+    with shell.page(UI_KEY) as demo:
         with gr.Tab("Translate"):
-            model_choice = gr.Radio(
-                choices=list(TRANSLATION_MODELS.keys()),
-                value="mBART-50 (50+ languages)",
-                label="Select Translation Model",
-            )
-
-            # mBART interface
-            with gr.Group(visible=True) as mbart_group:
-                gr.Markdown("### mBART-50: Multilingual Translation (50+ languages)")
-
-                with gr.Row():
-                    with gr.Column():
-                        mbart_text = gr.Textbox(
-                            label="Text to translate",
-                            placeholder="Enter text here...",
-                            lines=5,
-                        )
-                    with gr.Column():
-                        mbart_source = gr.Dropdown(
-                            choices=list(MBARTLANGUAGES.keys()),
-                            value="English",
-                            label="Source Language",
-                        )
-                        mbart_target = gr.Dropdown(
-                            choices=list(MBARTLANGUAGES.keys()),
-                            value="Spanish",
-                            label="Target Language",
-                        )
-                        mbart_btn = gr.Button("Translate", variant="primary")
-
-                mbart_output = gr.JSON(label="Translation Result")
-
-                gr.Examples(
-                    examples=EXAMPLES,
-                    inputs=[mbart_text, mbart_source, mbart_target],
-                    label="Try these examples",
-                )
-
-            # Helsinki interface
-            with gr.Group(visible=False) as helsinki_group:
-                gr.Markdown("### Helsinki OPUS: Specialized Language Pairs")
-
-                with gr.Row():
-                    with gr.Column():
-                        helsinki_text = gr.Textbox(
-                            label="Text to translate",
-                            placeholder="Enter text here...",
-                            lines=5,
-                        )
-                    with gr.Column():
-                        helsinki_pair = gr.Dropdown(
-                            choices=HELSINKI_LANGUAGE_PAIRS,
-                            value="en-es",
-                            label="Language Pair",
-                        )
-                        helsinki_btn = gr.Button("Translate", variant="primary")
-
-                helsinki_output = gr.JSON(label="Translation Result")
-
-            # Handle model switching
-            def update_visibility(model):
-                if "mBART" in model:
-                    return gr.Group(visible=True), gr.Group(visible=False)
-                else:
-                    return gr.Group(visible=False), gr.Group(visible=True)
-
-            model_choice.change(update_visibility, model_choice, [mbart_group, helsinki_group])
-
-        with gr.Tab("Batch Translation"):
-            gr.Markdown("""
-                ### Translate multiple texts at once
-                Enter multiple texts (one per line) to translate all of them.
-                """)
-
             with gr.Row():
-                with gr.Column():
-                    batch_texts = gr.Textbox(
-                        label="Texts to translate (one per line)",
-                        placeholder="Text 1\nText 2\nText 3\n...",
-                        lines=10,
+                with gr.Column(scale=3):
+                    text_input = gr.Textbox(label="Text to translate", placeholder="Type or paste text...", lines=6)
+                    sample_menu = gr.Dropdown(
+                        choices=list(SAMPLES),
+                        value=None,
+                        label="Load a sample",
+                        info="Fills the text and languages from data/translation_samples.txt.",
+                        visible=bool(SAMPLES),
                     )
+                with gr.Column(scale=2):
+                    model_radio = _model_radio()
+                    with gr.Row():
+                        source_dropdown, target_dropdown = _language_dropdowns()
+                    gr.Markdown(pairs_note)
+                    translate_btn = gr.Button("Translate", variant="primary")
+            with gr.Row():
+                translation_output = gr.Textbox(label="Translation", lines=6, buttons=["copy"], interactive=False)
+                details_output = gr.JSON(label="Details")
 
-                with gr.Column():
-                    batch_model_choice = gr.Radio(
-                        choices=list(TRANSLATION_MODELS.keys()),
-                        value="mBART-50 (50+ languages)",
-                        label="Select Model",
-                    )
-
-                    batch_mbart_source = gr.Dropdown(
-                        choices=list(MBARTLANGUAGES.keys()),
-                        value="English",
-                        label="Source Language",
-                        visible=True,
-                    )
-                    batch_mbart_target = gr.Dropdown(
-                        choices=list(MBARTLANGUAGES.keys()),
-                        value="Spanish",
-                        label="Target Language",
-                        visible=True,
-                    )
-
-                    batch_helsinki_pair = gr.Dropdown(
-                        choices=HELSINKI_LANGUAGE_PAIRS,
-                        value="en-es",
-                        label="Language Pair",
-                        visible=False,
-                    )
-
-                    batch_btn = gr.Button("Translate All", variant="primary")
-
-            batch_output = gr.Textbox(label="Batch Results", lines=15, max_lines=20)
-
-            # Handle batch model switching
-            def update_batch_visibility(model):
-                if "mBART" in model:
-                    return (
-                        gr.Dropdown(visible=True),
-                        gr.Dropdown(visible=True),
-                        gr.Dropdown(visible=False),
-                    )
-                else:
-                    return (
-                        gr.Dropdown(visible=False),
-                        gr.Dropdown(visible=False),
-                        gr.Dropdown(visible=True),
-                    )
-
-            batch_model_choice.change(
-                update_batch_visibility,
-                batch_model_choice,
-                [batch_mbart_source, batch_mbart_target, batch_helsinki_pair],
+        with gr.Tab("Batch"):
+            gr.Markdown(
+                f"One text per line, up to {shell.MAX_BATCH_ITEMS} lines. Every line is translated with the model "
+                "and languages selected here."
             )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    batch_input = gr.Textbox(
+                        label="Texts (one per line)", placeholder="First text\nSecond text", lines=10
+                    )
+                    gr.Button("Load example lines", size="sm").click(lambda: BATCH_EXAMPLE, outputs=batch_input)
+                    batch_model = _model_radio()
+                    with gr.Row():
+                        batch_source, batch_target = _language_dropdowns()
+                    batch_btn = gr.Button("Translate all", variant="primary")
+                with gr.Column(scale=3):
+                    batch_summary = gr.Markdown()
+                    batch_output = gr.Dataframe(headers=BATCH_COLUMNS, label="Results", wrap=True, interactive=False)
 
-        with gr.Tab("About"):
-            gr.Markdown("""
-                ## About This Tool
+        shell.about(ABOUT + "\n" + pairs_note, MODELS)
 
-                This translation hub provides access to state-of-the-art neural machine translation models.
-
-                ### Available Models:
-
-                **1. mBART-50 (Multilingual BART)**
-                - Supports 50+ languages
-                - Can translate between any supported language pair
-                - More flexible but may sacrifice some quality
-                - Good for rare language pairs
-
-                **2. Helsinki OPUS (Open Parallel Corpus)**
-                - Specialized models trained for specific language pairs
-                - Typically higher quality for supported pairs
-                - Limited to predefined language pairs
-                - Better for common language pairs (EN-ES, EN-FR, etc.)
-
-                ### Supported Languages:
-
-                **mBART-50:**
-                - English, Spanish, French, German, Italian, Portuguese
-                - Russian, Chinese, Japanese, Korean, Arabic, Hindi
-                - And 38+ more languages
-
-                **Helsinki OPUS:**
-                - en-es, en-fr, en-de, es-en, fr-en, de-en
-                - en-pt, pt-en, en-it, it-en
-
-                ### How to Use:
-
-                1. **Choose a model** based on your language pair and needs
-                2. **Enter text** in the source language
-                3. **Select languages** (source and target)
-                4. **Click Translate** to get the translation
-                5. **Use Batch mode** for translating multiple texts
-
-                ### Tips:
-
-                - For best results, use mBART for distant language pairs
-                - Use Helsinki for common language pairs if available
-                - Keep texts under 500 characters for faster processing
-                - Batch mode is useful for translating many documents
-
-                ### Limitations:
-
-                - Neural translation can make semantic mistakes
-                - Proper nouns and technical terms may not translate well
-                - Very long texts may lose context
-                - Quality varies by language pair
-
-                ### Common Use Cases:
-
-                - Business communication across languages
-                - Translating documentation
-                - Website localization
-                - Multilingual content analysis
-                """)
-
-        # Connect mBART components
-        mbart_btn.click(
-            fn=translate_mbart,
-            inputs=[mbart_text, mbart_source, mbart_target],
-            outputs=[mbart_output],
-        )
-
-        # Connect Helsinki components
-        helsinki_btn.click(
-            fn=translate_helsinki,
-            inputs=[helsinki_text, helsinki_pair],
-            outputs=[helsinki_output],
-        )
-
-        # Connect batch components
+        single_inputs = [text_input, model_radio, source_dropdown, target_dropdown]
+        translate_btn.click(translate, inputs=single_inputs, outputs=[translation_output, details_output])
+        sample_menu.input(use_sample, inputs=sample_menu, outputs=[text_input, source_dropdown, target_dropdown])
         batch_btn.click(
-            fn=batch_translate,
-            inputs=[
-                batch_texts,
-                batch_model_choice,
-                batch_mbart_source,
-                batch_mbart_target,
-                batch_helsinki_pair,
-            ],
-            outputs=[batch_output],
+            batch_translate,
+            inputs=[batch_input, batch_model, batch_source, batch_target],
+            outputs=[batch_output, batch_summary],
         )
-
     return demo
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7868, share=False, show_error=True)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])
