@@ -34,6 +34,7 @@ if str(_ROOT) not in sys.path:  # allow `python ui/<tool>.py` from any working d
     sys.path.insert(0, str(_ROOT))
 
 import gradio as gr  # noqa: E402
+from gradio.context import Context  # noqa: E402
 
 from config.settings import ModelConfig, get_model_registry, get_settings  # noqa: E402
 from ui.catalog import UIS, UIInfo  # noqa: E402
@@ -359,17 +360,34 @@ def page(ui_key: str, intro: Optional[str] = None) -> Iterator[gr.Blocks]:
         with shell.page("sentiment") as demo:
             ...components and events...
         return demo
+
+    Standalone, this opens a new ``gr.Blocks``. When called while another Blocks
+    is being built (the combined app in ui/app.py), it adds the page to that app
+    inside a column instead: rendering one Blocks inside another duplicates
+    nested tab containers in Gradio 6 and leaves some buttons wired to hidden copies.
     """
     entry = UIS[ui_key]
+    header = f"# {entry.emoji} {entry.title}\n\n{intro or entry.description}"
+    parent = Context.root_block
+    if parent is not None:
+        with gr.Column():
+            gr.Markdown(header)
+            yield parent
+            _footer()
+        return
     with gr.Blocks(title=f"{entry.title} · {APP_NAME}", analytics_enabled=False) as demo:
-        gr.Markdown(f"# {entry.emoji} {entry.title}\n\n{intro or entry.description}")
+        gr.Markdown(header)
         yield demo
-        settings = get_settings()
-        gr.Markdown(
-            f"{APP_NAME} · models download on first use and share one in-memory cache "
-            f"(up to {settings.max_cached_models} at a time) · nothing you enter is stored",
-            elem_classes=["tns-footer"],
-        )
+        _footer()
+
+
+def _footer() -> None:
+    settings = get_settings()
+    gr.Markdown(
+        f"{APP_NAME} · models download on first use and share one in-memory cache "
+        f"(up to {settings.max_cached_models} at a time) · nothing you enter is stored",
+        elem_classes=["tns-footer"],
+    )
 
 
 def about(markdown: str = "", *menus: ModelMenu, expanded: bool = False) -> None:

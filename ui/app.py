@@ -35,8 +35,9 @@ def create_app(keys: Optional[Iterable[str]] = None) -> gr.Blocks:
             for key in selected:
                 entry = shell.UIS[key]
                 module = importlib.import_module(entry.import_path)
-                with gr.Tab(f"{entry.emoji} {entry.title}", id=key):
-                    module.create_ui().render()
+                with gr.Tab(f"{entry.emoji} {entry.tab_label}", id=key):
+                    # Builds straight into this app (see shell.page); no nested Blocks.
+                    module.create_ui()
     return app
 
 
