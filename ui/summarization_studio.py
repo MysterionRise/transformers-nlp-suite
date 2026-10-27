@@ -1,436 +1,343 @@
 """
-Text Summarization Studio - Interactive UI for text summarization
+Summarization - abstractive summaries from one model or several side by side.
 
-Features:
-- Multiple summarization models comparison
-- Adjustable generation parameters
-- Side-by-side summary comparison
-- Summary statistics (compression ratio, readability)
-- Example articles for testing
+Models come from the ``summarization`` registry category (BART, DistilBART, T5,
+Pegasus) and load through the shared model cache. Each model's registry
+``min_length``/``max_length`` are the length defaults, T5 models get their
+``summarize: `` prefix, and input longer than the model's token limit is cut
+with a warning instead of failing inside the model.
 """
 
-import logging
+import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import gradio as gr
-from transformers import pipeline
+import pandas as pd
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/summarization_studio.py`
+    import common as shell  # type: ignore[no-redef]
 
-# Available summarization models
-SUMMARIZATION_MODELS = {
-    "BART Large CNN": "facebook/bart-large-cnn",
-    "T5 Large": "google/flan-t5-large",
-    "T5 Base": "t5-base",
-    "Pegasus XSum": "google/pegasus-xsum",
-    "DistilBART CNN": "sshleifer/distilbart-cnn-12-6",
-}
+logger = shell.get_logger(__name__)
 
-# Model cache
-model_cache = {}
+UI_KEY = "summarization"
+MODELS = shell.ModelMenu("summarization", default="bart_large_cnn")
 
+MIN_WORDS = 30
+FALLBACK_LENGTHS = (30, 130)
+COMPARE_COLUMNS = ["Model", "Summary", "Words", "Seconds"]
+COMPARE_DEFAULT = [MODELS.get("distilbart_cnn").name, MODELS.get("t5_base").name]
 
-def load_model(model_name: str):
-    """Load or retrieve cached summarization model"""
-    if model_name not in model_cache:
-        logger.info(f"Loading model: {model_name}")
-        try:
-            model_cache[model_name] = pipeline(
-                "summarization",
-                model=SUMMARIZATION_MODELS[model_name],
-                tokenizer=SUMMARIZATION_MODELS[model_name],
-            )
-            logger.info(f"Model {model_name} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model {model_name}: {e}")
-            raise
-    return model_cache[model_name]
+TAB_SUMMARIZE = "summarize"
+TAB_COMPARE = "compare"
+TAB_EXAMPLES = "examples"
 
 
-def calculate_stats(original: str, summary: str) -> Dict[str, str]:
-    """Calculate summary statistics"""
-    orig_words = len(original.split())
-    summ_words = len(summary.split())
-    orig_chars = len(original)
-    summ_chars = len(summary)
-
-    compression_ratio = (1 - summ_chars / orig_chars) * 100 if orig_chars > 0 else 0
-
-    return {
-        "Original Length": f"{orig_words} words, {orig_chars} characters",
-        "Summary Length": f"{summ_words} words, {summ_chars} characters",
-        "Compression Ratio": f"{compression_ratio:.1f}%",
-        "Reduction": f"{orig_words - summ_words} words removed",
-    }
+def length_defaults(model_name: Optional[str]) -> Tuple[int, int]:
+    """(min_length, max_length) in tokens from the model's registry entry."""
+    config = MODELS.get(model_name).config
+    return config.min_length or FALLBACK_LENGTHS[0], config.max_length or FALLBACK_LENGTHS[1]
 
 
-def summarize_text(
+def _validate(text: Optional[str], min_length: Any, max_length: Any) -> Tuple[str, int, int]:
+    text = shell.require_text(text, "some text to summarize")
+    words = len(text.split())
+    if words < MIN_WORDS:
+        shell.fail(f"Please enter at least {MIN_WORDS} words to summarize (this text has {words}).")
+    if min_length is None or max_length is None:
+        shell.fail("Please set both the minimum and the maximum summary length.")
+    min_length, max_length = int(min_length), int(max_length)
+    if min_length >= max_length:
+        shell.fail(
+            f"The minimum summary length ({min_length} tokens) must be smaller than the maximum ({max_length} tokens)."
+        )
+    return text, min_length, max_length
+
+
+def _special_tokens(tokenizer: Any) -> int:
+    try:
+        return int(tokenizer.num_special_tokens_to_add())
+    except Exception:
+        return 0
+
+
+def _run(
+    choice: shell.ModelChoice,
+    summarizer: Any,
     text: str,
-    model_name: str,
     min_length: int,
     max_length: int,
-    do_sample: bool = False,
-) -> Tuple[str, Dict, float]:
+    label: str = "Text",
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Summarize text using specified model
+    Summarize `text` with one loaded pipeline.
 
-    Args:
-        text: Input text to summarize
-        model_name: Name of the model to use
-        min_length: Minimum summary length
-        max_length: Maximum summary length
-        do_sample: Whether to use sampling
-
-    Returns:
-        Tuple of (summary, statistics, generation time)
+    Applies the registry prefix unless the pipeline already adds it (T5
+    checkpoints with ``task_specific_params`` do), clips the input to the
+    model's limit and caps ``max_length`` at the input length so short inputs
+    do not trigger the pipeline's "max_length is set to N" warning.
     """
-    if not text or not text.strip():
-        return "Please provide some text to summarize", {}, 0.0
+    tokenizer = getattr(summarizer, "tokenizer", None)
+    builtin = getattr(summarizer, "prefix", None) or ""
+    prefix = choice.config.prefix or ""
+    if prefix and builtin.strip() == prefix.strip():
+        prefix = ""  # the pipeline prepends it itself
+    reserve = shell.count_tokens(tokenizer, builtin + prefix) if tokenizer is not None and (builtin or prefix) else 0
 
-    if len(text.split()) < 30:
-        return (
-            "Text too short. Please provide at least 30 words for meaningful summarization.",
-            {},
-            0.0,
+    used = shell.clip_for_model(text, summarizer, label=label, reserve=reserve)
+    model_input = prefix + used
+
+    gen_min, gen_max = min_length, max_length
+    if tokenizer is not None:
+        input_tokens = shell.count_tokens(tokenizer, builtin + model_input) + _special_tokens(tokenizer)
+        if gen_max > input_tokens:
+            gen_max = input_tokens
+            if gen_min >= gen_max:
+                gen_min = max(1, gen_max // 2)
+            shell.info(
+                f"{choice.name}: the input is only {input_tokens} tokens, "
+                f"so the summary is limited to {gen_min} to {gen_max} tokens."
+            )
+
+    # No truncation=True: the input is already clipped, and BART tokenizers without
+    # model_max_length only log a "no maximum length" notice for it.
+    start = time.perf_counter()
+    output = summarizer(model_input, min_length=gen_min, max_length=gen_max, do_sample=False)
+    elapsed = time.perf_counter() - start
+
+    summary = output[0]["summary_text"].strip()
+    input_words, summary_words = len(used.split()), len(summary.split())
+    stats = {
+        "Model": choice.model_id,
+        "Input": f"{input_words} words" + (" (truncated to the model's limit)" if used != text else ""),
+        "Summary": f"{summary_words} words",
+        "Compression": f"{1 - summary_words / max(1, input_words):.0%} shorter",
+        "Length limits (tokens)": f"{gen_min} to {gen_max}",
+        "Generation time": f"{elapsed:.1f} s",
+    }
+    return summary, stats
+
+
+# --------------------------------------------------------------------------- handlers
+
+
+def summarize_text(text: str, model_name: str, min_length: float, max_length: float) -> Tuple[str, Dict[str, Any]]:
+    """Summarize with one model; returns the summary and statistics."""
+    text, min_length, max_length = _validate(text, min_length, max_length)
+    choice = MODELS.get(model_name)
+    summarizer = MODELS.load(model_name)
+    try:
+        return _run(choice, summarizer, text, min_length, max_length)
+    except Exception as exc:
+        shell.fail_from(exc, "Summarization")
+
+
+def compare_models(
+    text: str, model_names: Optional[List[str]], min_length: float, max_length: float
+) -> Iterator[pd.DataFrame]:
+    """
+    Summarize with several models one after another, yielding the table after
+    each model so results appear as they finish. A failing model is reported in
+    its row instead of failing the whole comparison.
+    """
+    text, min_length, max_length = _validate(text, min_length, max_length)
+    choices = [MODELS.get(name) for name in dict.fromkeys(model_names or [])]
+    if not choices:
+        shell.fail("Please select at least one model to compare.")
+
+    cache_size = shell.get_settings().max_cached_models
+    if len(choices) > cache_size:
+        shell.warn(
+            f"{len(choices)} models selected but the model cache holds {cache_size} "
+            "(NLP_MAX_CACHED_MODELS). They run one at a time and evict each other, "
+            "so each comparison reloads them."
         )
 
-    try:
-        # Load model
-        summarizer = load_model(model_name)
-
-        # Generate summary
-        start_time = time.time()
-
-        # Truncate input if too long
-        max_input_length = 1024
-        words = text.split()
-        if len(words) > max_input_length:
-            text = " ".join(words[:max_input_length])
-            logger.warning(f"Input truncated to {max_input_length} words")
-
-        summary = summarizer(
-            text,
-            min_length=min_length,
-            max_length=max_length,
-            do_sample=do_sample,
-            truncation=True,
-        )[
-            0
-        ]["summary_text"]
-
-        gen_time = time.time() - start_time
-
-        # Calculate statistics
-        stats = calculate_stats(text, summary)
-        stats["Generation Time"] = f"{gen_time:.2f} seconds"
-
-        return summary, stats, gen_time
-
-    except Exception as e:
-        logger.error(f"Error summarizing text: {e}")
-        return f"Error: {str(e)}", {}, 0.0
+    rows: List[List[Any]] = []
+    for choice in choices:
+        start = time.perf_counter()
+        try:
+            summarizer = MODELS.load(choice.name)
+            summary, _ = _run(choice, summarizer, text, min_length, max_length, label=f"Text for {choice.name}")
+            rows.append([choice.name, summary, len(summary.split()), round(time.perf_counter() - start, 1)])
+        except Exception as exc:
+            message = exc.message if isinstance(exc, gr.Error) else f"{type(exc).__name__}: {exc}"
+            logger.warning(f"Comparison: {choice.name} failed: {message}")
+            shell.warn(f"{choice.name} failed; see its row for details.")
+            rows.append([choice.name, f"Error: {message[:300]}", 0, round(time.perf_counter() - start, 1)])
+        yield pd.DataFrame(rows, columns=COMPARE_COLUMNS)
 
 
-def compare_models(text: str, models: List[str], min_length: int, max_length: int) -> List[Tuple[str, str, Dict]]:
-    """
-    Compare multiple models on the same text
-
-    Args:
-        text: Input text
-        models: List of model names
-        min_length: Minimum summary length
-        max_length: Maximum summary length
-
-    Returns:
-        List of (model_name, summary, stats) tuples
-    """
-    if not text or not text.strip():
-        return [("Error", "Please provide some text to summarize", {})]
-
-    if not models or len(models) == 0:
-        return [("Error", "Please select at least one model", {})]
-
-    results = []
-    for model_name in models:
-        summary, stats, _ = summarize_text(text, model_name, min_length, max_length)
-        results.append((model_name, summary, stats))
-
-    return results
+def use_article(article: str) -> Tuple[str, gr.Tabs]:
+    """Put an example article into the summarize box and switch to that tab."""
+    return article, gr.Tabs(selected=TAB_SUMMARIZE)
 
 
-def format_comparison_results(results: List[Tuple[str, str, Dict]]) -> str:
-    """Format comparison results as markdown"""
-    if not results:
-        return "No results to display"
+# --------------------------------------------------------------------------- page
 
-    markdown = "# Summary Comparison\n\n"
+EXAMPLE_ARTICLES = {
+    "Amazon rainforest": (
+        "The Amazon rainforest, also known as Amazonia, is a moist broadleaf tropical "
+        "rainforest in the Amazon biome that covers most of the Amazon basin of South "
+        "America. This basin encompasses 7,000,000 km2 (2,700,000 sq mi), of which "
+        "5,500,000 km2 (2,100,000 sq mi) are covered by the rainforest. The majority of "
+        "the forest is contained within Brazil, with 60% of the rainforest, followed by "
+        "Peru with 13%, Colombia with 10%, and with minor amounts in Bolivia, Ecuador, "
+        "French Guiana, Guyana, Suriname, and Venezuela.\n\n"
+        "The Amazon represents over half of the planet's remaining rainforests, and "
+        "comprises the largest and most biodiverse tract of tropical rainforest in the "
+        "world, with an estimated 390 billion individual trees divided into 16,000 species. "
+        "The region is home to about 2.5 million insect species, tens of thousands of "
+        "plants, and some 2,000 birds and mammals. To date, at least 40,000 plant species, "
+        "2,200 fishes, 1,294 birds, 427 mammals, 428 amphibians, and 378 reptiles have been "
+        "scientifically classified in the region.\n\n"
+        "The rainforest likely formed during the Eocene era, following the extinction event "
+        "which wiped out the dinosaurs. It appeared following a global reduction of tropical "
+        "temperatures when the Atlantic Ocean had widened sufficiently to provide a warm, "
+        "moist climate to the Amazon basin. The rainforest has been in existence for at "
+        "least 55 million years, and most of the region remained free of savanna-type biomes "
+        "during glacial periods, allowing for the survival and evolution of a broad diversity "
+        "of species."
+    ),
+    "Artificial intelligence": (
+        "Artificial intelligence (AI) is intelligence demonstrated by machines, as opposed "
+        "to natural intelligence displayed by animals including humans. AI research has been "
+        "defined as the field of study of intelligent agents, which refers to any system that "
+        "perceives its environment and takes actions that maximize its chance of achieving "
+        'its goals. The term "artificial intelligence" had previously been used to describe '
+        'machines that mimic and display "human" cognitive skills that are associated with '
+        'the human mind, such as "learning" and "problem-solving". This definition has '
+        "since been rejected by major AI researchers who now describe AI in terms of "
+        "rationality and acting rationally, which does not limit how intelligence can be "
+        "articulated.\n\n"
+        "AI applications include advanced web search engines, recommendation systems, "
+        "understanding human speech, self-driving cars, generative or creative tools, "
+        "automated decision-making and competing at the highest level in strategic game "
+        "systems. As machines become increasingly capable, tasks considered to require "
+        '"intelligence" are often removed from the definition of AI, a phenomenon known '
+        "as the AI effect. For instance, optical character recognition is frequently excluded "
+        "from things considered to be AI, having become a routine technology.\n\n"
+        "Artificial intelligence was founded as an academic discipline in 1956, and in the "
+        "years since it has experienced several waves of optimism, followed by disappointment "
+        "and the loss of funding, followed by new approaches, success and renewed funding. "
+        "AI research has tried and discarded many different approaches, including simulating "
+        "the brain, modeling human problem solving, formal logic, large databases of knowledge "
+        "and imitating animal behavior. In the first decades of the 21st century, highly "
+        "mathematical and statistical machine learning has dominated the field, and this "
+        "technique has proved highly successful, helping to solve many challenging problems "
+        "throughout industry and academia."
+    ),
+    "Climate change": (
+        "Climate change refers to long-term shifts in temperatures and weather patterns. "
+        "Such shifts can be natural, due to changes in the sun's activity or large volcanic "
+        "eruptions. But since the 1800s, human activities have been the main driver of "
+        "climate change, primarily due to the burning of fossil fuels like coal, oil, and "
+        "gas. Burning fossil fuels generates greenhouse gas emissions that act like a blanket "
+        "wrapped around the Earth, trapping the sun's heat and raising temperatures.\n\n"
+        "The main greenhouse gases that are causing climate change include carbon dioxide and "
+        "methane. These come from using gasoline for driving a car or coal for heating a "
+        "building, for example. Clearing land and cutting down forests can also release "
+        "carbon dioxide. Agriculture, oil and gas operations are major sources of methane "
+        "emissions. Energy, industry, transport, buildings, agriculture and land use are "
+        "among the main sectors causing greenhouse gases.\n\n"
+        "The consequences of climate change now include intense droughts, water scarcity, "
+        "severe fires, rising sea levels, flooding, melting polar ice, catastrophic storms "
+        "and declining biodiversity. People are experiencing climate change in diverse ways. "
+        "It affects our health, ability to grow food, housing, safety and work. Some of us "
+        "are already more vulnerable to climate impacts, such as people living in small "
+        "island nations and other developing countries. Conditions like sea-level rise and "
+        "saltwater intrusion have advanced to the point where whole communities have had to "
+        "relocate, and protracted droughts are putting people at risk of famine. In the "
+        "future, the number of climate refugees is expected to rise."
+    ),
+}
 
-    for model_name, summary, stats in results:
-        markdown += f"## {model_name}\n\n"
-        markdown += f"**Summary:**\n{summary}\n\n"
-        markdown += "**Statistics:**\n"
-        for key, value in stats.items():
-            markdown += f"- {key}: {value}\n"
-        markdown += "\n---\n\n"
+ABOUT = f"""
+Lengths are measured in model **tokens** (roughly three quarters of a word each). Choosing a
+model resets the sliders to that model's defaults. Input needs at least {MIN_WORDS} words; text
+longer than the model's limit (about 1,000 tokens for BART, 512 for T5 and Pegasus) is cut and
+you get a warning.
 
-    return markdown
-
-
-# Example articles
-EXAMPLE_ARTICLE_1 = (
-    "The Amazon rainforest, also known as Amazonia, is a moist broadleaf tropical "
-    "rainforest in the Amazon biome that covers most of the Amazon basin of South "
-    "America. This basin encompasses 7,000,000 km2 (2,700,000 sq mi), of which "
-    "5,500,000 km2 (2,100,000 sq mi) are covered by the rainforest. The majority of "
-    "the forest is contained within Brazil, with 60% of the rainforest, followed by "
-    "Peru with 13%, Colombia with 10%, and with minor amounts in Bolivia, Ecuador, "
-    "French Guiana, Guyana, Suriname, and Venezuela.\n\n"
-    "The Amazon represents over half of the planet's remaining rainforests, and "
-    "comprises the largest and most biodiverse tract of tropical rainforest in the "
-    "world, with an estimated 390 billion individual trees divided into 16,000 species. "
-    "The region is home to about 2.5 million insect species, tens of thousands of "
-    "plants, and some 2,000 birds and mammals. To date, at least 40,000 plant species, "
-    "2,200 fishes, 1,294 birds, 427 mammals, 428 amphibians, and 378 reptiles have been "
-    "scientifically classified in the region.\n\n"
-    "The rainforest likely formed during the Eocene era, following the extinction event "
-    "which wiped out the dinosaurs. It appeared following a global reduction of tropical "
-    "temperatures when the Atlantic Ocean had widened sufficiently to provide a warm, "
-    "moist climate to the Amazon basin. The rainforest has been in existence for at "
-    "least 55 million years, and most of the region remained free of savanna-type biomes "
-    "during glacial periods, allowing for the survival and evolution of a broad diversity "
-    "of species."
-)
-
-EXAMPLE_ARTICLE_2 = (
-    "Artificial intelligence (AI) is intelligence demonstrated by machines, as opposed "
-    "to natural intelligence displayed by animals including humans. AI research has been "
-    "defined as the field of study of intelligent agents, which refers to any system that "
-    "perceives its environment and takes actions that maximize its chance of achieving "
-    'its goals. The term "artificial intelligence" had previously been used to describe '
-    'machines that mimic and display "human" cognitive skills that are associated with '
-    'the human mind, such as "learning" and "problem-solving". This definition has '
-    "since been rejected by major AI researchers who now describe AI in terms of "
-    "rationality and acting rationally, which does not limit how intelligence can be "
-    "articulated.\n\n"
-    "AI applications include advanced web search engines, recommendation systems, "
-    "understanding human speech, self-driving cars, generative or creative tools, "
-    "automated decision-making and competing at the highest level in strategic game "
-    "systems. As machines become increasingly capable, tasks considered to require "
-    '"intelligence" are often removed from the definition of AI, a phenomenon known '
-    "as the AI effect. For instance, optical character recognition is frequently excluded "
-    "from things considered to be AI, having become a routine technology.\n\n"
-    "Artificial intelligence was founded as an academic discipline in 1956, and in the "
-    "years since it has experienced several waves of optimism, followed by disappointment "
-    "and the loss of funding, followed by new approaches, success and renewed funding. "
-    "AI research has tried and discarded many different approaches, including simulating "
-    "the brain, modeling human problem solving, formal logic, large databases of knowledge "
-    "and imitating animal behavior. In the first decades of the 21st century, highly "
-    "mathematical and statistical machine learning has dominated the field, and this "
-    "technique has proved highly successful, helping to solve many challenging problems "
-    "throughout industry and academia."
-)
-
-EXAMPLE_ARTICLE_3 = (
-    "Climate change refers to long-term shifts in temperatures and weather patterns. "
-    "Such shifts can be natural, due to changes in the sun's activity or large volcanic "
-    "eruptions. But since the 1800s, human activities have been the main driver of "
-    "climate change, primarily due to the burning of fossil fuels like coal, oil, and "
-    "gas. Burning fossil fuels generates greenhouse gas emissions that act like a blanket "
-    "wrapped around the Earth, trapping the sun's heat and raising temperatures.\n\n"
-    "The main greenhouse gases that are causing climate change include carbon dioxide and "
-    "methane. These come from using gasoline for driving a car or coal for heating a "
-    "building, for example. Clearing land and cutting down forests can also release "
-    "carbon dioxide. Agriculture, oil and gas operations are major sources of methane "
-    "emissions. Energy, industry, transport, buildings, agriculture and land use are "
-    "among the main sectors causing greenhouse gases.\n\n"
-    "The consequences of climate change now include intense droughts, water scarcity, "
-    "severe fires, rising sea levels, flooding, melting polar ice, catastrophic storms "
-    "and declining biodiversity. People are experiencing climate change in diverse ways. "
-    "It affects our health, ability to grow food, housing, safety and work. Some of us "
-    "are already more vulnerable to climate impacts, such as people living in small "
-    "island nations and other developing countries. Conditions like sea-level rise and "
-    "saltwater intrusion have advanced to the point where whole communities have had to "
-    "relocate, and protracted droughts are putting people at risk of famine. In the "
-    "future, the number of climate refugees is expected to rise."
-)
+Tips: BART and DistilBART (trained on CNN/DailyMail news) write extractive-style, multi-sentence
+summaries; Pegasus XSum writes one very short sentence; T5 is a general text-to-text model.
+The comparison tab runs models one after another, so selecting more models than the cache
+holds makes them reload on every run.
+"""
 
 
-def create_ui():
-    """Create and configure the Gradio interface"""
+def _length_sliders(defaults: Tuple[int, int]) -> Tuple[gr.Slider, gr.Slider]:
+    with gr.Row():
+        min_slider = gr.Slider(5, 200, value=defaults[0], step=5, label="Minimum summary length (tokens)")
+        max_slider = gr.Slider(20, 512, value=defaults[1], step=10, label="Maximum summary length (tokens)")
+    return min_slider, max_slider
 
-    with gr.Blocks(title="Text Summarization Studio", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-            # 📝 Text Summarization Studio
 
-            Generate concise summaries from long-form text using state-of-the-art transformer models.
-            Compare different models and fine-tune parameters for optimal results!
-            """)
+def create_ui() -> gr.Blocks:
+    """Build the summarization page."""
+    first_article = next(iter(EXAMPLE_ARTICLES.values()))
+    with shell.page(UI_KEY) as demo:
+        with gr.Tabs(selected=TAB_SUMMARIZE) as tabs:
+            with gr.Tab("Summarize", id=TAB_SUMMARIZE):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        single_text = gr.Textbox(label="Text to summarize", value=first_article, lines=14)
+                        single_model = MODELS.dropdown()
+                        single_btn = gr.Button("Summarize", variant="primary")
+                        single_min, single_max = _length_sliders(length_defaults(MODELS.default))
+                    with gr.Column(scale=2):
+                        summary_output = gr.Textbox(label="Summary", lines=10, interactive=False)
+                        stats_output = gr.JSON(label="Statistics")
 
-        with gr.Tab("Single Model"):
-            gr.Markdown("### Summarize text with a single model")
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    single_text = gr.Textbox(
-                        label="Input Text",
-                        placeholder="Paste your article or text here...",
-                        lines=15,
-                        value=EXAMPLE_ARTICLE_1,
-                    )
-
-                    with gr.Row():
-                        single_model = gr.Dropdown(
-                            choices=list(SUMMARIZATION_MODELS.keys()),
-                            value="BART Large CNN",
-                            label="Select Model",
+            with gr.Tab("Compare models", id=TAB_COMPARE):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        compare_text = gr.Textbox(
+                            label="Text to summarize",
+                            value=EXAMPLE_ARTICLES["Artificial intelligence"],
+                            lines=14,
+                        )
+                        compare_select = gr.CheckboxGroup(
+                            choices=MODELS.names,
+                            value=COMPARE_DEFAULT,
+                            label="Models to compare",
+                            info=f"Run one after another; the cache holds "
+                            f"{shell.get_settings().max_cached_models} models at a time.",
+                        )
+                        compare_btn = gr.Button("Compare", variant="primary")
+                        compare_min, compare_max = _length_sliders(FALLBACK_LENGTHS)
+                    with gr.Column(scale=3):
+                        comparison_output = gr.Dataframe(
+                            headers=COMPARE_COLUMNS, label="Summaries", wrap=True, interactive=False
                         )
 
-                    with gr.Row():
-                        min_length = gr.Slider(
-                            minimum=10,
-                            maximum=100,
-                            value=30,
-                            step=5,
-                            label="Minimum Length (words)",
-                        )
-                        max_length = gr.Slider(
-                            minimum=50,
-                            maximum=300,
-                            value=130,
-                            step=10,
-                            label="Maximum Length (words)",
-                        )
+            with gr.Tab("Example articles", id=TAB_EXAMPLES):
+                article_buttons = []
+                for title, article in EXAMPLE_ARTICLES.items():
+                    with gr.Group():
+                        gr.Textbox(value=article, label=title, lines=6, interactive=False)
+                        article_buttons.append((gr.Button(f"Use this article: {title}", size="sm"), article))
 
-                    single_btn = gr.Button("Generate Summary", variant="primary")
+        shell.about(ABOUT, MODELS)
 
-                with gr.Column(scale=2):
-                    summary_output = gr.Textbox(label="Generated Summary", lines=10)
-                    stats_output = gr.JSON(label="Statistics")
-
-        with gr.Tab("Model Comparison"):
-            gr.Markdown("### Compare summaries from multiple models side-by-side")
-
-            with gr.Row():
-                with gr.Column(scale=1):
-                    compare_text = gr.Textbox(
-                        label="Input Text",
-                        placeholder="Paste your article or text here...",
-                        lines=15,
-                        value=EXAMPLE_ARTICLE_2,
-                    )
-
-                    compare_models_select = gr.CheckboxGroup(
-                        choices=list(SUMMARIZATION_MODELS.keys()),
-                        value=["BART Large CNN", "T5 Large"],
-                        label="Select Models to Compare",
-                    )
-
-                    with gr.Row():
-                        compare_min = gr.Slider(
-                            minimum=10,
-                            maximum=100,
-                            value=30,
-                            step=5,
-                            label="Min Length",
-                        )
-                        compare_max = gr.Slider(
-                            minimum=50,
-                            maximum=300,
-                            value=130,
-                            step=10,
-                            label="Max Length",
-                        )
-
-                    compare_btn = gr.Button("Compare Models", variant="primary")
-
-                with gr.Column(scale=2):
-                    comparison_output = gr.Markdown(label="Comparison Results")
-
-        with gr.Tab("Example Articles"):
-            gr.Markdown("### Try these example articles")
-
-            with gr.Tabs():
-                with gr.Tab("Amazon Rainforest"):
-                    gr.Textbox(value=EXAMPLE_ARTICLE_1, lines=20, interactive=False)
-                    copy_btn1 = gr.Button("Use This Article")
-
-                with gr.Tab("Artificial Intelligence"):
-                    gr.Textbox(value=EXAMPLE_ARTICLE_2, lines=20, interactive=False)
-                    copy_btn2 = gr.Button("Use This Article")
-
-                with gr.Tab("Climate Change"):
-                    gr.Textbox(value=EXAMPLE_ARTICLE_3, lines=20, interactive=False)
-                    copy_btn3 = gr.Button("Use This Article")
-
-        with gr.Tab("About"):
-            gr.Markdown("""
-                ## About Text Summarization Studio
-
-                This tool provides state-of-the-art text summarization using transformer-based models.
-
-                ### Available Models:
-
-                1. **BART Large CNN** - Trained on CNN/DailyMail dataset, excellent for news articles
-                2. **T5 Large** - Versatile model from Google, good for various text types
-                3. **T5 Base** - Faster, lighter version of T5
-                4. **Pegasus XSum** - Optimized for extreme summarization
-                5. **DistilBART CNN** - Distilled version of BART, faster inference
-
-                ### Features:
-
-                - **Adjustable Parameters**: Control summary length with min/max length sliders
-                - **Model Comparison**: Compare multiple models side-by-side
-                - **Statistics**: Track compression ratio, word count, generation time
-                - **Example Articles**: Pre-loaded articles for quick testing
-
-                ### Tips:
-
-                - **Minimum Input**: Provide at least 30 words for meaningful summarization
-                - **Optimal Length**: Articles with 200-1000 words work best
-                - **Model Selection**:
-                  - Use BART for news articles
-                  - Use T5 for scientific or technical text
-                  - Use Pegasus for very short summaries
-                - **Length Parameters**:
-                  - Min length: Ensures summaries aren't too brief
-                  - Max length: Controls maximum summary size
-                  - Typical ratio: 15-30% of original length
-
-                ### Use Cases:
-
-                - News article summarization
-                - Research paper abstracts
-                - Document summarization
-                - Content curation
-                - Information extraction
-                - Quick reading/scanning
-                """)
-
-        # Connect components - Single Model
         single_btn.click(
-            fn=lambda t, m, min_l, max_l: summarize_text(t, m, min_l, max_l)[:2],
-            inputs=[single_text, single_model, min_length, max_length],
+            summarize_text,
+            inputs=[single_text, single_model, single_min, single_max],
             outputs=[summary_output, stats_output],
         )
-
-        # Connect components - Model Comparison
-        compare_btn.click(
-            fn=lambda t, m, min_l, max_l: format_comparison_results(compare_models(t, m, min_l, max_l)),
-            inputs=[compare_text, compare_models_select, compare_min, compare_max],
-            outputs=[comparison_output],
+        single_model.change(
+            length_defaults, inputs=single_model, outputs=[single_min, single_max], api_visibility="undocumented"
         )
-
-        # Copy example articles
-        copy_btn1.click(fn=lambda: EXAMPLE_ARTICLE_1, outputs=[single_text])
-        copy_btn2.click(fn=lambda: EXAMPLE_ARTICLE_2, outputs=[single_text])
-        copy_btn3.click(fn=lambda: EXAMPLE_ARTICLE_3, outputs=[single_text])
-
+        compare_btn.click(
+            compare_models,
+            inputs=[compare_text, compare_select, compare_min, compare_max],
+            outputs=comparison_output,
+        )
+        for button, article in article_buttons:
+            button.click(lambda a=article: use_article(a), outputs=[single_text, tabs], api_visibility="undocumented")
     return demo
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7863, share=False, show_error=True)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])
