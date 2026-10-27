@@ -42,8 +42,13 @@ class APISettings(BaseModel):
     )
 
     # Rate limiting defaults
-    default_rate_limit: int = Field(default=100, description="Default requests per minute")
-    rate_limit_window_seconds: int = Field(default=60, description="Rate limit window in seconds")
+    default_rate_limit: int = Field(
+        default=100, ge=1, description="Requests per window for API keys without their own rate_limit"
+    )
+    anonymous_rate_limit: int = Field(
+        default=20, ge=1, description="Requests per window per client IP without valid credentials"
+    )
+    rate_limit_window_seconds: int = Field(default=60, ge=1, description="Rate limit window in seconds")
 
     # CORS settings - defaults to localhost only; override via NLP_API__CORS_ORIGINS
     cors_origins: List[str] = Field(

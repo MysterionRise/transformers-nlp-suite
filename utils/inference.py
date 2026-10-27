@@ -13,9 +13,11 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from config.settings import get_model_registry
+from utils.labels import normalize_sentiment_label, num_labels_of
 from utils.logger import get_logger
 from utils.metrics import track_inference_time
 from utils.model_cache import get_model_cache
+from utils.text_limits import token_limit, truncate_to_tokens
 
 logger = get_logger(__name__)
 
@@ -50,20 +52,19 @@ class InferenceService:
         )
 
     @staticmethod
-    def _normalize_sentiment_label(label: str) -> str:
-        label = (label or "unknown").lower()
-        label_map = {
-            "label_0": "negative",
-            "label_1": "neutral",
-            "label_2": "positive",
-            "neg": "negative",
-            "pos": "positive",
-            "neu": "neutral",
-            "negative": "negative",
-            "positive": "positive",
-            "neutral": "neutral",
-        }
-        return label_map.get(label, label)
+    def _normalize_sentiment_label(label: str, num_labels: Optional[int] = None) -> str:
+        return normalize_sentiment_label(label, num_labels)
+
+    @staticmethod
+    def _fit_to_model(model: Any, text: str, reserve: int = 0) -> str:
+        """Cut text to the model's token limit (models without a tokenizer are left alone)."""
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is None:
+            return text
+        clipped, count = truncate_to_tokens(text, tokenizer, max(1, token_limit(model) - reserve))
+        if clipped != text:
+            logger.info(f"Input truncated from {count} tokens to the model limit", extra={"tokens": count})
+        return clipped
 
     @staticmethod
     def _as_score_list(raw_result: Any) -> List[Dict[str, Any]]:
@@ -84,17 +85,18 @@ class InferenceService:
         def _inference():
             with track_inference_time(model_config.model_id, "sentiment"):
                 model = self.cache.get_model("sentiment_analysis", model_key)
-                return model(text)
+                return model(self._fit_to_model(model, text), top_k=None), num_labels_of(model)
 
-        raw_result = await asyncio.to_thread(_inference)
+        raw_result, num_labels = await asyncio.to_thread(_inference)
         all_scores = []
         for item in self._as_score_list(raw_result):
             all_scores.append(
                 {
-                    "label": self._normalize_sentiment_label(item.get("label", "unknown")),
+                    "label": self._normalize_sentiment_label(item.get("label", "unknown"), num_labels),
                     "score": float(item.get("score", 0.0)),
                 }
             )
+        all_scores.sort(key=lambda item: item["score"], reverse=True)
 
         primary = max(all_scores, key=lambda item: item["score"]) if all_scores else {"label": "unknown", "score": 0.0}
         processing_time_ms = (time.time() - start_time) * 1000
@@ -117,22 +119,27 @@ class InferenceService:
         def _inference():
             with track_inference_time(model_config.model_id, "sentiment_batch"):
                 model = self.cache.get_model("sentiment_analysis", model_key)
-                return model(texts)
+                fitted = [self._fit_to_model(model, text) for text in texts]
+                return model(fitted, top_k=None), num_labels_of(model)
 
-        raw_results = await asyncio.to_thread(_inference)
+        raw_results, num_labels = await asyncio.to_thread(_inference)
         total_time_ms = (time.time() - start_time) * 1000
         per_text_time_ms = total_time_ms / max(len(texts), 1)
         self._log_success("sentiment_batch", model_key, model_config.model_id, total_time_ms)
 
         responses = []
         for text, raw_result in zip(texts, raw_results):
-            scores = [
-                {
-                    "label": self._normalize_sentiment_label(item.get("label", "unknown")),
-                    "score": float(item.get("score", 0.0)),
-                }
-                for item in self._as_score_list(raw_result)
-            ]
+            scores = sorted(
+                (
+                    {
+                        "label": self._normalize_sentiment_label(item.get("label", "unknown"), num_labels),
+                        "score": float(item.get("score", 0.0)),
+                    }
+                    for item in self._as_score_list(raw_result)
+                ),
+                key=lambda item: item["score"],
+                reverse=True,
+            )
             primary = max(scores, key=lambda item: item["score"]) if scores else {"label": "unknown", "score": 0.0}
             responses.append(
                 {
@@ -159,7 +166,13 @@ class InferenceService:
         def _inference():
             with track_inference_time(model_config.model_id, "summarization"):
                 model = self.cache.get_model("summarization", model_key)
-                return model(text, min_length=min_length, max_length=max_length, do_sample=False)
+                source = (model_config.prefix or "") + text
+                return model(
+                    self._fit_to_model(model, source),
+                    min_length=min_length,
+                    max_length=max_length,
+                    do_sample=False,
+                )
 
         result = await asyncio.to_thread(_inference)
         if isinstance(result, list) and result:

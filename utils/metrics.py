@@ -102,8 +102,8 @@ auth_attempts_total = Counter(
 # Rate limiting metrics
 rate_limit_hits_total = Counter(
     "rate_limit_hits_total",
-    "Total number of rate limit hits",
-    ["api_key_prefix"],
+    "Total number of rate limit rejections by client type",
+    ["client_type"],
 )
 
 
@@ -202,11 +202,9 @@ def record_auth_attempt(method: str, success: bool):
     auth_attempts_total.labels(method=method, status=status).inc()
 
 
-def record_rate_limit_hit(api_key: Optional[str]):
-    """Record a rate limit hit"""
-    # Use prefix for privacy
-    prefix = api_key[:8] if api_key else "anonymous"
-    rate_limit_hits_total.labels(api_key_prefix=prefix).inc()
+def record_rate_limit_hit(client_type: Optional[str]):
+    """Record a rate limit rejection (client_type: api_key, jwt or anonymous; bounded cardinality)."""
+    rate_limit_hits_total.labels(client_type=client_type or "anonymous").inc()
 
 
 def record_http_request(method: str, endpoint: str, status_code: int, duration_ms: float):

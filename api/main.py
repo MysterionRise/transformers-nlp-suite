@@ -1,5 +1,5 @@
 """
-FastAPI Application - Customer Intelligence NLP Platform
+FastAPI Application - Transformers NLP Suite
 
 Production-minded REST API for customer-intelligence NLP inference with:
 - JWT and API key authentication
@@ -9,13 +9,16 @@ Production-minded REST API for customer-intelligence NLP inference with:
 """
 
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Annotated, Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Security
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.middleware.auth import api_key_header
 from api.middleware.logging import RequestLoggingMiddleware
 from api.middleware.rate_limit import RateLimitMiddleware
 from api.routers import customer_intelligence, health, ner, qa, sentiment, similarity, summarization
@@ -34,7 +37,7 @@ async def lifespan(app: FastAPI):
     - Shutdown: Clean up resources
     """
     # Startup
-    logger.info("Starting Customer Intelligence NLP Platform API...")
+    logger.info("Starting Transformers NLP Suite API...")
 
     # Set startup time for health endpoint
     from api.routers.health import set_startup_time
@@ -55,12 +58,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not load settings: {e}")
 
-    logger.info("Customer Intelligence NLP Platform API started successfully")
+    logger.info("Transformers NLP Suite API started successfully")
 
     yield
 
     # Shutdown
-    logger.info("Shutting down Customer Intelligence NLP Platform API...")
+    logger.info("Shutting down Transformers NLP Suite API...")
 
     # Clear model cache to free memory
     try:
@@ -70,7 +73,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    logger.info("Customer Intelligence NLP Platform API shut down complete")
+    logger.info("Transformers NLP Suite API shut down complete")
+
+
+HTTP_ERROR_CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    413: "payload_too_large",
+    429: "rate_limit_exceeded",
+    503: "service_unavailable",
+}
 
 
 def create_app() -> FastAPI:
@@ -81,56 +96,54 @@ def create_app() -> FastAPI:
         Configured FastAPI application instance
     """
     app = FastAPI(
-        title="Customer Intelligence NLP Platform",
+        title="Transformers NLP Suite",
         description="""
 ## Overview
 
-API-first Customer Intelligence platform for turning reviews, support notes,
-and market text into structured NLP signals.
-
-### Features
-
-- **Sentiment Analysis**: Analyze text sentiment (positive/negative/neutral)
-- **Text Summarization**: Generate concise summaries
-- **Named Entity Recognition**: Extract people, organizations, locations, dates
-- **Semantic Similarity**: Compare text similarity using embeddings
-- **Question Answering**: Extract answers from context
-- **Customer Intelligence Workflow**: Combine sentiment, entities, aggregates, and summaries
+Transformers NLP Suite: an API-first service that turns customer reviews, support
+notes and market text into structured NLP signals (sentiment, entities, similarity,
+summaries and extractive answers), plus a combined customer-intelligence workflow.
 
 ### Authentication
 
-All endpoints require authentication via one of:
-- **API Key**: Include `X-API-Key` header
-- **JWT Token**: Include `Authorization: Bearer <token>` header
+Inference endpoints require one of:
+- **API key**: `X-API-Key` header
+- **JWT**: `Authorization: Bearer <token>`, obtained from `POST /api/v1/auth/token`
 
-### Rate Limiting
+Use the **Authorize** button to set either credential for "Try it out".
+Health, readiness, metrics and model-listing endpoints are public.
 
-Requests are rate-limited based on your API key tier:
-- **Admin**: 1000 requests/minute
-- **User**: 100 requests/minute
-- **Demo**: 20 requests/minute
+### Rate limiting
 
-Rate limit headers are included in all responses:
-- `X-RateLimit-Limit`: Maximum requests per window
-- `X-RateLimit-Remaining`: Remaining requests
-- `X-RateLimit-Reset`: Unix timestamp when window resets
+Requests are counted per verified client in fixed windows (60 s by default):
+each API key has its own `rate_limit`, a JWT shares the budget of the key it was
+issued for, and requests without valid credentials share a per-IP anonymous limit
+(20 by default). Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+`X-RateLimit-Reset` (window end, Unix time) and `X-RateLimit-Backend`; over-limit
+requests get `429` with `Retry-After`.
 
-### Error Handling
+### Input limits
 
-All errors follow a consistent format:
+Text longer than a model's context window is truncated to the model's token limit
+(for example 512 tokens for the sentiment models, 1,024 for BART summarization).
+
+### Errors
+
+Every error uses the same envelope:
 ```json
 {
-  "error": "error_type",
+  "error": "error_code",
   "message": "Human-readable description",
   "details": {},
-  "request_id": "req_xxx"
+  "request_id": "a1b2c3d4"
 }
 ```
+`details` is present when there is more to report (validation errors list each field).
         """,
         version="1.0.0",
         contact={
-            "name": "API Support",
-            "email": "support@example.com",
+            "name": "Transformers NLP Suite on GitHub",
+            "url": "https://github.com/MysterionRise/transformers-nlp-suite",
         },
         license_info={
             "name": "MIT",
@@ -156,19 +169,21 @@ All errors follow a consistent format:
     except Exception as e:
         logger.warning(f"OpenTelemetry instrumentation not enabled: {e}")
 
-    # Add CORS middleware - origins loaded from settings (default: localhost only)
+    # Middleware order: Starlette runs the middleware added LAST outermost.
+    # RateLimit is added first so it runs inside RequestLogging and CORS: its 429
+    # responses then carry X-Request-ID, are logged and counted, and get CORS headers.
     try:
         from config.settings import get_settings
 
         settings = get_settings()
         cors_origins = settings.api.cors_origins
-        default_rate_limit = settings.api.default_rate_limit
         rate_limit_window_seconds = settings.api.rate_limit_window_seconds
     except Exception:
         cors_origins = ["http://localhost:3000", "http://localhost:8000"]
-        default_rate_limit = 100
         rate_limit_window_seconds = 60
 
+    app.add_middleware(RateLimitMiddleware, window_seconds=rate_limit_window_seconds)
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -181,15 +196,8 @@ All errors follow a consistent format:
             "X-RateLimit-Limit",
             "X-RateLimit-Remaining",
             "X-RateLimit-Reset",
+            "Retry-After",
         ],
-    )
-
-    # Add custom middleware
-    app.add_middleware(RequestLoggingMiddleware)
-    app.add_middleware(
-        RateLimitMiddleware,
-        default_limit=default_rate_limit,
-        window_seconds=rate_limit_window_seconds,
     )
 
     # Include routers
@@ -201,19 +209,19 @@ All errors follow a consistent format:
     app.include_router(qa.router)
     app.include_router(customer_intelligence.router)
 
-    # Custom exception handlers
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException):
+    # Custom exception handlers. Registered for Starlette's HTTPException so routing
+    # errors (404, 405) use the same envelope as errors raised by the routers.
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         """Custom HTTP exception handler with consistent error format"""
         request_id = getattr(request.state, "request_id", None)
 
-        # Handle dict detail (our custom format)
         if isinstance(exc.detail, dict):
-            content = exc.detail
+            content = dict(exc.detail)
             content["request_id"] = request_id
         else:
             content = {
-                "error": "http_error",
+                "error": HTTP_ERROR_CODES.get(exc.status_code, "http_error"),
                 "message": str(exc.detail),
                 "request_id": request_id,
             }
@@ -221,7 +229,28 @@ All errors follow a consistent format:
         return JSONResponse(
             status_code=exc.status_code,
             content=content,
-            headers=exc.headers,
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        """422 responses in the documented error envelope instead of FastAPI's default shape"""
+        details = [
+            {
+                "field": ".".join(str(part) for part in error.get("loc", ()) if part != "body"),
+                "message": error.get("msg", ""),
+                "type": error.get("type", ""),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "validation_error",
+                "message": "Request validation failed",
+                "details": details,
+                "request_id": getattr(request.state, "request_id", None),
+            },
         )
 
     @app.exception_handler(Exception)
@@ -258,24 +287,12 @@ def custom_openapi() -> Dict[str, Any]:
         routes=app.routes,
     )
 
-    # Add security schemes
-    openapi_schema["components"]["securitySchemes"] = {
-        "ApiKeyAuth": {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-API-Key",
-            "description": "API key for authentication",
-        },
-        "BearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT",
-            "description": "JWT token for authentication",
-        },
-    }
-
-    # Apply security to all endpoints
-    openapi_schema["security"] = [{"ApiKeyAuth": []}, {"BearerAuth": []}]
+    # Security schemes come from the auth dependencies (ApiKeyAuth, BearerAuth) and
+    # are attached only to the operations that use them, so public endpoints such as
+    # /health show no lock and Swagger's "Authorize" credentials are sent by "Try it out".
+    schemes = openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    schemes.setdefault("ApiKeyAuth", {"type": "apiKey", "in": "header", "name": "X-API-Key"})
+    schemes.setdefault("BearerAuth", {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"})
 
     # Add tags metadata
     openapi_schema["tags"] = [
@@ -350,21 +367,33 @@ async def root():
         401: {"description": "Invalid API key"},
     },
 )
-async def get_token(request: Request):
+async def get_token(
+    request: Request,
+    api_key: Annotated[Optional[str], Security(api_key_header)] = None,
+):
     """
     Generate a JWT token from an API key
 
     Send your API key in the X-API-Key header to receive a JWT token.
     """
-    from api.middleware.auth import create_access_token, verify_api_key
+    from api.middleware.auth import create_access_token, get_api_settings, verify_api_key
 
-    api_key = request.headers.get("X-API-Key")
     if not api_key:
         raise HTTPException(
             status_code=401,
             detail={
                 "error": "unauthorized",
                 "message": "X-API-Key header is required",
+            },
+        )
+
+    api_settings = get_api_settings()
+    if not api_settings.jwt_secret:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "jwt_not_configured",
+                "message": "JWT authentication is not configured on this server (NLP_API__JWT_SECRET is empty)",
             },
         )
 
@@ -383,5 +412,5 @@ async def get_token(request: Request):
     return {
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": 86400,  # 24 hours
+        "expires_in": int(api_settings.jwt_expiration_hours * 3600),
     }

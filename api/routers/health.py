@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
 
 from api.middleware.auth import User, get_optional_user
 from api.schemas.responses import HealthResponse, MetricsResponse, ModelInfo, ModelsListResponse, ReadinessResponse
@@ -79,17 +80,20 @@ async def health_check() -> HealthResponse:
     "/ready",
     response_model=ReadinessResponse,
     summary="Readiness probe",
-    description="Returns 200 if the service is ready to accept requests. " "Checks model cache and configuration.",
+    description="Returns 200 when the service is ready to accept requests and 503 (same body, "
+    'status "not_ready") when a check fails: configuration, registry, auth configuration, model cache, '
+    "and Redis when NLP_REDIS_URL is set.",
     responses={
         200: {
             "description": "Service is ready",
         },
         503: {
-            "description": "Service is not ready",
+            "description": "Service is not ready; `checks` shows which check failed",
+            "model": ReadinessResponse,
         },
     },
 )
-async def readiness_check() -> ReadinessResponse:
+async def readiness_check():
     """
     Readiness probe endpoint
 
@@ -139,15 +143,16 @@ async def readiness_check() -> ReadinessResponse:
     except Exception:
         checks["redis_available"] = False
 
-    # Determine overall status
+    # Determine overall status; probes act on the HTTP status code, so not-ready is a 503
     all_passed = all(checks.values())
-    status = "ready" if all_passed else "not_ready"
-
-    return ReadinessResponse(
-        status=status,
+    body = ReadinessResponse(
+        status="ready" if all_passed else "not_ready",
         checks=checks,
         timestamp=datetime.now(timezone.utc),
     )
+    if not all_passed:
+        return JSONResponse(status_code=503, content=body.model_dump(mode="json"))
+    return body
 
 
 @router.get(
