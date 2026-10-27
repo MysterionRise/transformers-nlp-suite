@@ -41,6 +41,9 @@ def token_limit(model: Any, default: int = 512) -> int:
             pad = getattr(config, "pad_token_id", 1)
             positions -= (pad if isinstance(pad, int) else 1) + 1
         limits.append(positions)
+    max_seq_length = getattr(model, "max_seq_length", None)  # SentenceTransformer models
+    if isinstance(max_seq_length, int) and max_seq_length > 0:
+        limits.append(max_seq_length)
     limit = min(limits) if limits else default
     special = 2
     if tokenizer is not None and hasattr(tokenizer, "num_special_tokens_to_add"):
@@ -53,7 +56,7 @@ def token_limit(model: Any, default: int = 512) -> int:
 
 def count_tokens(tokenizer: Any, text: str) -> int:
     """Number of tokens in `text`, without special tokens."""
-    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+    return len(tokenizer(text, add_special_tokens=False, verbose=False)["input_ids"])
 
 
 def truncate_to_tokens(text: str, tokenizer: Any, max_tokens: int) -> Tuple[str, int]:

@@ -30,6 +30,11 @@ class TestTokenLimit:
     def test_bart_style_uses_positions(self):
         assert token_limit(_model("bart", 1024, int(1e30), pad=1)) == 1022
 
+    def test_sentence_transformer_max_seq_length_caps_the_limit(self):
+        model = _model("bert", 512, 512)
+        model.max_seq_length = 256
+        assert token_limit(model) == 254
+
     def test_default_when_unknown(self):
         assert token_limit(SimpleNamespace(), default=100) == 98
 

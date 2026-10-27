@@ -185,12 +185,8 @@ class TestAuthentication:
         response = client.post("/api/v1/auth/token", headers={"X-API-Key": "admin-key"})
         assert response.status_code == 503
         assert response.json()["error"] == "jwt_not_configured"
-        assert (
-            client.post(
-                "/api/v1/sentiment", headers={"Authorization": f"Bearer {token}"}, json={"text": "x"}
-            ).status_code
-            == 401
-        )
+        with_token = client.post("/api/v1/sentiment", headers={"Authorization": f"Bearer {token}"}, json={"text": "x"})
+        assert with_token.status_code == 401
 
     def test_expires_in_follows_settings(self, client, api_settings):
         api_settings.api.jwt_expiration_hours = 2

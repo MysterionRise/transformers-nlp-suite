@@ -31,16 +31,9 @@ def _source(entry):
     return (UI_DIR / f"{entry.module}.py").read_text()
 
 
-def _migrated(entry) -> bool:
-    return "import common as shell" in _source(entry)
-
-
 @pytest.fixture(params=sorted(UIS), ids=sorted(UIS))
 def entry(request):
-    ui = UIS[request.param]
-    if not _migrated(ui):
-        pytest.skip(f"{ui.module} has not been migrated to ui/common.py yet")
-    return ui
+    return UIS[request.param]
 
 
 def test_catalog_matches_files():
@@ -54,6 +47,7 @@ def test_source_uses_shell_only(entry):
     problems = [name for name, pattern in FORBIDDEN.items() if pattern.search(source)]
     assert not problems, f"{entry.module}: {problems}"
     assert f'UI_KEY = "{entry.key}"' in source
+    assert "import common as shell" in source, f"{entry.module} must build on ui/common.py"
 
 
 def test_builds_without_warnings_or_model_loads(entry):

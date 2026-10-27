@@ -13,7 +13,8 @@ All notable changes to this project are documented here. The format follows
 - `NLP_API__ANONYMOUS_RATE_LIMIT` setting for clients without valid credentials.
 - `ModelCache.get_registry_model()` / `load_registry_model()` dispatching on the registry `framework` (transformers, sentence-transformers, spaCy, GLiNER); optional pinned `revision` per registry entry.
 - CI `docker` job: builds the image, waits for `/ready`, smoke-tests NER and rate limiting, and starts the combined UI app.
-- Regression tests for rate limiting, auth edge cases, error envelopes, readiness, OpenAPI security, input limits, the UI shell and the UI architecture rules.
+- Regression tests for rate limiting, auth edge cases, error envelopes, readiness, OpenAPI security, input limits, the UI shell, every UI, and the UI architecture rules (about 200 new tests).
+- A "Models and cache" tab in the evaluation UI showing the registry and the shared cache.
 
 ### Changed
 
@@ -42,6 +43,15 @@ All notable changes to this project are documented here. The format follows
 - `docker compose --profile ui up ui-launcher` started the API instead of any UI.
 - The "DeBERTa MNLI" zero-shot entry pointed at a base checkpoint without an NLI head.
 - `NLP_MAX_CACHED_MODELS=0` made the first request spin forever.
+- Demo UI fixes found by browser and real-model testing:
+  - NER showed no entities (the results table needed the uninstalled `tabulate`); it now uses a data table, loads spaCy on first use instead of at startup (about 140 s), and keeps the Extract button reachable.
+  - mBART translation always failed (wrong pipeline arguments), and batch translation ignored the selected model; Helsinki OPUS-MT is now the small default.
+  - The evaluation UI crashed when launched as documented and downloaded NLTK data at import; BERTScore (about 1.4 GB) is now opt-in, and its export is linked to the batch results.
+  - QA returned too few outputs on empty input (raw Gradio errors), silently cut contexts to 2,000 characters, had no "no answer" handling, and could not read its own sample file.
+  - The generation seed was never used, and long prompts left no room for new text.
+  - Similarity advertised UMAP without implementing it and crashed on fewer than two sentences.
+  - Summarization labelled token sliders as words, accepted min >= max, and crashed on long articles.
+  - Sentiment coloured the winning bar by score, so a winning "negative" bar was green.
 
 ### Security
 
