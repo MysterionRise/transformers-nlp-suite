@@ -1,5 +1,5 @@
 """
-Utilities package for the Customer Intelligence NLP Platform
+Utilities package for the Transformers NLP Suite
 
 This package provides shared utilities for error handling, logging,
 model caching, and other common functionality.

@@ -1,12 +1,12 @@
-# Customer Intelligence NLP Platform
+# Transformers NLP Suite
 
 [![CI](https://github.com/MysterionRise/transformers-nlp-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/MysterionRise/transformers-nlp-suite/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-API-first NLP platform for turning customer reviews, support notes, and market text into structured intelligence signals. The main proof point is the FastAPI service: authenticated endpoints, shared model caching, Redis-backed rate limiting, Prometheus metrics, structured logs, Docker Compose runtime, and CI-covered tests.
+API-first NLP service for customer-intelligence work: it turns customer reviews, support notes and market text into structured signals with Hugging Face, sentence-transformers and spaCy models. The main proof point is the FastAPI service: authenticated endpoints, a shared model cache, per-client rate limiting backed by Redis, Prometheus metrics, structured logs, a Docker Compose runtime and CI-covered tests.
 
-Gradio UIs remain available as optional demos, but the product story is the API.
+Ten Gradio demo UIs sit on top of the same model registry and cache. They are optional; the product story is the API.
 
 ## What It Does
 
@@ -14,25 +14,26 @@ Gradio UIs remain available as optional demos, but the product story is the API.
 - Extracts named entities with spaCy or transformer-backed NER models.
 - Computes semantic similarity with sentence-transformers embeddings.
 - Generates summaries and extractive QA answers from supplied text.
-- Combines these into `/api/v1/customer-intelligence/analyze` for portfolio-grade customer feedback analysis.
+- Combines these into `/api/v1/customer-intelligence/analyze` for customer feedback analysis.
 - Exposes runtime state through `/health`, `/ready`, `/metrics`, and `/api/v1/status`.
 
 ## Current Status
 
 Implemented and verified:
 
-- Docker Compose API stack: `docker compose up api redis`
-- API key and JWT authentication
+- Docker Compose API stack (`docker compose up api redis`), built and smoke-tested by the CI `docker` job
+- API key and JWT authentication, with Swagger UI's **Authorize** button working for "Try it out"
 - Nested environment loading for `NLP_API__...` settings
-- Shared inference layer over transformers, sentence-transformers, and spaCy
-- LRU model cache with hit, miss, eviction, and size metrics
-- Redis-backed rate limiting when `NLP_REDIS_URL` is configured, with memory fallback for local/test use
-- Fast mocked API tests and slow real-model integration tests in CI
+- Shared inference layer over transformers, sentence-transformers, and spaCy, with inputs cut to each model's token limit
+- Thread-safe LRU model cache (one load per model under concurrency) with hit, miss, eviction, and size metrics
+- Per-client rate limiting: Redis counters when `NLP_REDIS_URL` is reachable, a bounded in-memory fallback otherwise, and `429` with `Retry-After` when exceeded
+- Demo UIs built on one shared shell (`ui/common.py`) and servable together from one process
+- Fast mocked API tests, slow real-model integration tests, and an image build in CI
 - Architecture, operations, evaluation, model-card, and ADR documentation
 
 Important limitations:
 
-- The bundled demo key is for local portfolio review only.
+- The bundled demo key is for local review only.
 - First real-model requests can be slow because models are downloaded and loaded lazily.
 - The tracked eval set is a smoke check, not a production quality benchmark.
 - This is not intended for high-stakes or regulated automated decisions.
@@ -41,7 +42,7 @@ Important limitations:
 
 ### Docker Compose
 
-The canonical local proof is the API plus Redis:
+The canonical local run is the API plus Redis:
 
 ```bash
 docker compose up api redis
@@ -69,6 +70,10 @@ python launch_ui.py api
 ```
 
 By default, local API docs are available at http://localhost:8000/docs.
+
+Export the JSON value with single quotes as shown. Running `source .env.example` in a shell strips the inner quotes, so the API starts with no valid keys; copy the file to `.env` instead (the settings loader reads it) or use Docker's `env_file`.
+
+On a CPU-only machine, `pip install --index-url https://download.pytorch.org/whl/cpu torch` before the requirements avoids several GB of CUDA libraries.
 
 ## API Examples
 
@@ -171,6 +176,8 @@ curl -X POST http://localhost:8000/api/v1/sentiment \
   -d '{"text": "The new workflow is much faster."}'
 ```
 
+A token counts against the rate limit of the key it was issued for.
+
 ## Endpoint Reference
 
 | Endpoint | Method | Auth | Purpose |
@@ -187,22 +194,49 @@ curl -X POST http://localhost:8000/api/v1/sentiment \
 | `/api/v1/models/{category}` | GET | No | List models in one category |
 | `/api/v1/status` | GET | Optional | Request, latency, cache, and uptime summary |
 | `/health` | GET | No | Liveness probe |
-| `/ready` | GET | No | Config, registry, auth, cache, and Redis readiness |
+| `/ready` | GET | No | Readiness: config, registry, auth, cache, and Redis; `503` when a check fails |
 | `/metrics` | GET | No | Prometheus exposition |
+
+Public endpoints other than `/health`, `/ready`, `/metrics` and the docs pages still count against the anonymous per-IP rate limit.
+
+### Errors, Limits and Rate Limiting
+
+Every error, including validation (`422`), routing (`404`, `405`) and rate-limit (`429`) errors, uses one envelope:
+
+```json
+{"error": "validation_error", "message": "Request validation failed", "details": [...], "request_id": "a1b2c3d4"}
+```
+
+`request_id` matches the `X-Request-ID` response header.
+
+Rate limits are counted per verified client in fixed windows (60 seconds by default). Each API key has its own `rate_limit`; a JWT shares the budget of the key it was issued for; requests without valid credentials, including unknown keys, share a per-IP anonymous limit (20 by default). Every limited response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (end of the window, Unix time) and `X-RateLimit-Backend` (`redis` or `memory`).
+
+Text longer than a model's context window is cut to the model's token limit, for example 512 tokens for the sentiment models and 1,024 for BART summarization. Whitespace-only text is rejected.
 
 ## Configuration
 
 Key environment variables:
 
-| Variable | Purpose |
-| --- | --- |
-| `NLP_API__JWT_SECRET` | JWT signing secret |
-| `NLP_API__API_KEYS` | JSON map of API keys to name, role, rate limit, and enabled flag |
-| `NLP_REDIS_URL` | Redis backend for shared rate limiting |
-| `NLP_MAX_CACHED_MODELS` | LRU model-cache size |
-| `NLP_LOG_LEVEL` | Logging level |
-| `NLP_JSON_LOGS` | Emit JSON logs when `true` |
-| `NLP_OTEL_ENABLED` | Enable optional OpenTelemetry FastAPI instrumentation |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NLP_API__JWT_SECRET` | empty | JWT signing secret. While empty, JWTs are rejected and `/api/v1/auth/token` returns 503 |
+| `NLP_API__API_KEYS` | `{}` | JSON map of API keys to name, role, rate limit, and enabled flag |
+| `NLP_API__JWT_EXPIRATION_HOURS` | `24` | Token lifetime |
+| `NLP_API__DEFAULT_RATE_LIMIT` | `100` | Requests per window for keys without their own `rate_limit` |
+| `NLP_API__ANONYMOUS_RATE_LIMIT` | `20` | Requests per window per IP without valid credentials |
+| `NLP_API__RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window |
+| `NLP_API__CORS_ORIGINS` | localhost:3000, localhost:8000 | Allowed browser origins |
+| `NLP_REDIS_URL` | unset | Redis backend for shared rate limiting |
+| `NLP_MAX_CACHED_MODELS` | `3` | LRU model-cache size (at least 1) |
+| `NLP_CACHE_DIR` | unset | Model download directory; unset uses the Hugging Face default (`HF_HOME`) |
+| `NLP_DEVICE` | `auto` | `auto`, `cpu`, `cuda`, or `mps` |
+| `NLP_LOG_LEVEL` | `INFO` | Logging level |
+| `NLP_JSON_LOGS` | `false` | Emit JSON logs when `true` |
+| `NLP_OTEL_ENABLED` | `false` | OpenTelemetry FastAPI instrumentation (needs `opentelemetry-instrumentation-fastapi` installed) |
+| `NLP_SERVER_NAME` | `127.0.0.1` | Bind address for the demo UIs; containers use `0.0.0.0` |
+| `NLP_SERVER_PORT` | `7860` | Port of the combined demo UI app |
+| `NLP_UI_THEME` | `soft` | Gradio theme: `soft`, `default`, `glass`, `monochrome`, `base` |
+| `NLP_SHARE` | `false` | Create public Gradio share links |
 
 Model defaults live in `utils/inference.py` and model definitions live in `config/models.yaml`.
 
@@ -216,19 +250,20 @@ Default API models:
 
 ## Architecture
 
-The API routers do not load models directly. They call `utils/inference.py`, which performs model lookup, output normalization, timing, and access to the shared cache in `utils/model_cache.py`.
+The API routers do not load models directly. They call `utils/inference.py`, which performs model lookup, input clipping, output normalization, timing, and access to the shared cache in `utils/model_cache.py`.
 
 The cache supports:
 
 - Hugging Face transformers pipelines
 - sentence-transformers embedding models
 - spaCy language pipelines
+- GLiNER zero-shot NER (used by the demo UIs)
 
 Operational instrumentation includes:
 
 - Request logging with request ID, auth method, user role, status code, latency, and error type
 - Inference logs with task, model key, model ID, status, and latency
-- Prometheus counters and histograms for HTTP requests, inference, cache, auth attempts, errors, and rate-limit hits
+- Prometheus counters and histograms for HTTP requests, inference, cache, auth attempts, errors, and rate-limit rejections
 - `/api/v1/status` summaries from real in-process request and cache state
 
 For more detail, see [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -241,6 +276,7 @@ CI runs:
 - Fast tests on Python 3.11, 3.12, and 3.13
 - Slow real-model integration tests on Python 3.11
 - Full test suite with coverage on Python 3.11
+- A Docker image build that starts the API and Redis, waits for `/ready`, smoke-tests NER and rate limiting, and starts the combined UI app
 
 Useful local commands:
 
@@ -253,40 +289,47 @@ python scripts/benchmark_api.py --api-url http://localhost:8000 --api-key <key>
 
 The tracked eval data is in `data/customer_intelligence_eval.json`. It is intentionally small and should be treated as a smoke/regression set, not as evidence of production model quality. See [EVAL_REPORT.md](EVAL_REPORT.md).
 
-## Optional Gradio UIs
+## Demo UIs
 
-The UI layer is secondary but still available:
+Ten Gradio UIs cover sentiment, similarity, NER, summarization, evaluation metrics, QA, generation, zero-shot classification, translation and vision-language. They are built on one shell (`ui/common.py`): model menus come from `config/models.yaml`, models load through the same cache as the API, and long inputs are cut with a visible warning. See [ADR 0004](docs/adr/0004-shared-ui-shell.md).
 
-```bash
-python launch_ui.py
-python launch_ui.py sentiment
-python launch_ui.py similarity
-python launch_ui.py ner
-python launch_ui.py summarization
-python launch_ui.py performance
-python launch_ui.py qa
-python launch_ui.py generation
-python launch_ui.py zero_shot
-python launch_ui.py translation
-python launch_ui.py vision
-```
-
-Docker Compose UI profiles:
+All UIs in one app (one process, one shared model cache):
 
 ```bash
-docker compose --profile ui up ui-launcher
-docker compose --profile individual up sentiment qa generation
+python launch_ui.py all                 # http://127.0.0.1:7860
+python launch_ui.py all --host 0.0.0.0  # reachable from other machines
 ```
+
+One UI at a time:
+
+```bash
+python launch_ui.py --list
+python launch_ui.py sentiment           # or similarity, ner, summarization, performance,
+                                        # qa, generation, zero_shot, translation, vision
+python -m ui.qa_system --port 9000      # any UI module also runs directly
+```
+
+Docker Compose:
+
+```bash
+docker compose --profile ui up ui-launcher            # all UIs on :7860
+docker compose --profile individual up sentiment qa   # one container per UI
+```
+
+The `ui` and `individual` profiles both use host port 7860 for sentiment, so run one or the other.
 
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): system design and tradeoffs
 - [OPERATIONS.md](OPERATIONS.md): local, Docker, cloud, monitoring, and runbooks
+- [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md): image, Compose and Kubernetes notes
 - [EVAL_REPORT.md](EVAL_REPORT.md): current eval set, CI coverage, limitations, next steps
 - [MODEL_CARD.md](MODEL_CARD.md): intended use, out-of-scope use, default models, risks
+- [CHANGELOG.md](CHANGELOG.md): release history
 - [ADR 0001](docs/adr/0001-shared-inference-cache.md): shared inference cache
 - [ADR 0002](docs/adr/0002-redis-rate-limiting.md): Redis rate limiting
 - [ADR 0003](docs/adr/0003-api-based-evaluation.md): API-based evaluation
+- [ADR 0004](docs/adr/0004-shared-ui-shell.md): shared UI shell
 
 ## Portfolio Read
 

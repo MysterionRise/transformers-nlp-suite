@@ -2,16 +2,19 @@
 
 ## Product Boundary
 
-Customer Intelligence NLP Platform is an API-first service for extracting structured signals from customer-facing text: reviews, support tickets, survey comments, app-store feedback, and market notes.
+Transformers NLP Suite is an API-first service for extracting structured signals from customer-facing text: reviews, support tickets, survey comments, app-store feedback, and market notes.
 
-The primary runtime is FastAPI. Gradio UIs are retained as optional demos and are not the main production proof point.
+The primary runtime is FastAPI. Gradio UIs are optional demos built on the same model registry and cache; they are not the main production proof point.
 
 ## Runtime Components
 
 ```text
 Client
-  -> FastAPI middleware
-      -> request ID, logging, metrics, rate limiting, auth
+  -> FastAPI middleware (outermost first)
+      -> CORS
+      -> request ID, logging, metrics
+      -> rate limiting (per verified identity)
+  -> auth dependency (API key or JWT)
   -> API router
       -> validation and response schema
   -> shared inference service
@@ -69,26 +72,30 @@ Routers do not instantiate models. They call `utils.inference.InferenceService`,
 
 - registry key validation
 - access to the central cache
-- normalized response shapes
+- clipping input to the model's real token limit (from the model config, since many tokenizers report no limit)
+- normalized response shapes and sentiment labels
 - task-level inference timing
 - structured inference logs
 
-`utils/model_cache.py` supports three adapter families:
+`utils/model_cache.py` dispatches on each registry entry's `framework`:
 
-- Hugging Face transformers pipelines for sentiment, summarization, QA, and transformer NER
+- Hugging Face transformers pipelines for sentiment, summarization, QA, zero-shot, translation and vision tasks
 - sentence-transformers for semantic similarity
 - spaCy for fast local NER
+- GLiNER for zero-shot NER
 
-Models are loaded lazily and evicted with a process-local LRU strategy. This keeps startup fast and avoids loading every configured model into memory.
+Models are loaded lazily and evicted with a process-local LRU strategy. Cache bookkeeping is guarded by a lock and each model has its own load lock, so concurrent requests for the same cold model load it once. Registry entries can pin a `revision`. Downloads use the Hugging Face cache (`HF_HOME`) unless `NLP_CACHE_DIR` is set.
 
 ## Auth And Rate Limiting
 
-Inference endpoints require an API key or JWT. `/api/v1/auth/token` exchanges an API key for a JWT.
+Inference endpoints require an API key or JWT. `/api/v1/auth/token` exchanges an API key for a JWT; tokens must carry `exp`, and nothing validates while `NLP_API__JWT_SECRET` is empty.
 
-Rate limiting chooses the backend at runtime:
+Rate limiting counts requests in fixed windows per verified identity: a valid API key has its own bucket and `rate_limit`, a JWT shares its key's bucket, and everything else (no credentials, unknown keys, bad tokens) shares a per-IP anonymous bucket. Over-limit requests receive `429` with `Retry-After`.
 
-- Redis fixed-window counters when `NLP_REDIS_URL` is configured and reachable
-- in-memory counters for tests or local no-Redis development
+The counter backend is chosen at runtime:
+
+- Redis fixed-window counters when `NLP_REDIS_URL` is configured and reachable (250 ms socket timeouts, 30 s back-off after a failure)
+- a bounded in-memory store (10,000 buckets) for tests, local runs, or while Redis is unavailable
 
 The memory fallback is intentionally not a multi-replica production strategy.
 
@@ -105,9 +112,20 @@ Implemented observability paths:
 
 ## Testing Strategy
 
-Fast tests mock inference so they do not download models. They verify auth, validation, response contracts, rate-limit headers, metrics/status shapes, and workflow aggregation.
+Fast tests mock inference so they do not download models. They verify auth (including expired, unsigned and revoked tokens), validation and error envelopes, response contracts, rate limiting (429s, bucket identity, Redis back-off), OpenAPI security, metrics/status shapes, and workflow aggregation.
 
 Slow tests exercise selected real-model paths on Python 3.11 in CI. CI also runs fast tests on Python 3.11, 3.12, and 3.13.
+
+## Demo UIs
+
+The Gradio UIs in `ui/` share one shell, `ui/common.py` (see ADR 0004):
+
+- model menus are generated from `config/models.yaml`
+- models load through `utils/model_cache.py`, so the UIs and the API share weights and memory limits
+- errors surface as Gradio error toasts, and truncation to a model limit is announced with a warning
+- host, port, share links and theme come from `Settings`
+
+`ui/catalog.py` lists titles and ports; `ui/app.py` renders every UI as a tab of one app, which is how `docker compose --profile ui up ui-launcher` and `python launch_ui.py all` run them.
 
 ## Tradeoffs
 

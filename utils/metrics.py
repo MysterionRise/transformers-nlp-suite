@@ -19,7 +19,7 @@ from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest
 
 # Application info
 app_info = Info("nlp_api", "NLP API application information")
-app_info.info({"version": "1.0.0", "name": "Customer Intelligence NLP Platform"})
+app_info.info({"version": "1.0.0", "name": "Transformers NLP Suite"})
 
 # Request metrics
 http_requests_total = Counter(

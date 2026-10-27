@@ -13,7 +13,7 @@ Open:
 - Readiness: http://localhost:8000/ready
 - Metrics: http://localhost:8000/metrics
 
-The Compose API service uses `.env.example`. The included API key is only for local portfolio demos.
+The Compose API service uses `.env.example`. The included API key is only for local demos.
 
 ## Local Python Run
 
@@ -28,6 +28,8 @@ python launch_ui.py api
 ```
 
 Use `python launch_ui.py api --host 0.0.0.0 --port 8000` when binding outside localhost.
+
+Do not `source .env.example` in a shell: bash strips the quotes inside the JSON value of `NLP_API__API_KEYS` and the API starts without valid keys. Copy it to `.env` (read by the settings loader) or export the values as shown.
 
 ## Required Environment
 
@@ -50,7 +52,7 @@ Optional:
 ## Readiness And Health
 
 - `/health`: liveness only; should remain cheap and always return healthy while the process is running.
-- `/ready`: verifies configuration, registry, auth configuration, model cache initialization, and Redis availability when Redis is configured.
+- `/ready`: verifies configuration, registry, auth configuration, model cache initialization, and Redis availability when Redis is configured. Returns `503` with the failing check in `checks` when any check fails, so load balancers and Kubernetes probes stop routing traffic.
 - `/api/v1/status`: request counts, average latency by endpoint, model-cache stats, and uptime.
 - `/metrics`: Prometheus metrics.
 
@@ -62,7 +64,7 @@ Watch these first:
 - Inference latency and error counts from `model_inference_duration_seconds` and `model_inference_total`.
 - Cache behavior from `model_cache_hits_total`, `model_cache_misses_total`, `model_cache_evictions_total`, and `model_cache_size`.
 - Auth failures from `auth_attempts_total`.
-- Rate-limit pressure from `rate_limit_hits_total`.
+- Rate-limit rejections from `rate_limit_hits_total` (labelled by `client_type`: `api_key`, `jwt`, `anonymous`).
 
 ## Security Defaults
 
@@ -109,8 +111,10 @@ Unexpected 401s:
 
 Unexpected 429s:
 
-- Check `X-RateLimit-*` headers.
-- Confirm Redis availability if deployed with multiple replicas.
+- Check the `X-RateLimit-*` headers and `Retry-After`; `X-RateLimit-Reset` is the end of the current window.
+- Requests without valid credentials (including unknown keys) share the per-IP anonymous limit (`NLP_API__ANONYMOUS_RATE_LIMIT`); behind a proxy, start uvicorn with `--proxy-headers` so client IPs are real.
+- A JWT counts against the rate limit of the key it was issued for.
+- Confirm Redis availability if deployed with multiple replicas (`X-RateLimit-Backend: memory` means counters are per replica).
 - Inspect `rate_limit_hits_total`.
 
 NER failures:
@@ -129,7 +133,9 @@ Model loading failures:
 UIs are not part of the canonical runtime. Use them for demos:
 
 ```bash
-docker compose --profile ui up ui-launcher
-python launch_ui.py sentiment
-python launch_ui.py qa
+docker compose --profile ui up ui-launcher   # all UIs in one app on :7860
+python launch_ui.py all                      # same, locally
+python launch_ui.py sentiment                # a single UI
 ```
+
+The combined app shares one model cache, so `NLP_MAX_CACHED_MODELS` bounds memory across every tool. UIs bind to `NLP_SERVER_NAME` (127.0.0.1 by default).

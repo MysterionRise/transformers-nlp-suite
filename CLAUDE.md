@@ -34,8 +34,9 @@ pytest --cov=. --cov-report=html # Generate coverage report
 **UI Launches:**
 ```bash
 python launch_ui.py              # Interactive menu
+python launch_ui.py all          # Every UI as tabs in one app (port 7860, one shared model cache)
 python launch_ui.py sentiment    # Specific UI
-python ui/sentiment_playground.py # Direct launch (port 7860)
+python -m ui.sentiment_playground --port 7860   # Direct launch (`python ui/<file>.py` also works)
 ```
 
 ### Python Version
@@ -49,7 +50,7 @@ python ui/sentiment_playground.py # Direct launch (port 7860)
 The project uses a **centralized, Pydantic-validated configuration system** with YAML-based model registry:
 
 - **`settings.py`**: Defines `Settings` (app configuration) and `ModelRegistry` (model definitions)
-- **`models.yaml`**: YAML file with 25+ pre-configured models across 8 categories (sentiment_analysis, summarization, embeddings, ner, etc.)
+- **`models.yaml`**: YAML registry of every model the API and UIs can load (about 40 models across 14 categories: sentiment_analysis, summarization, embeddings, ner, etc.)
 - **Singleton pattern**: `get_settings()` and `get_model_registry()` use LRU caching to return cached instances
 - **Environment variable support**: Settings can be overridden with `NLP_*` prefix (e.g., `NLP_DEBUG=true`, `NLP_MAX_CACHED_MODELS=5`)
 
@@ -108,12 +109,20 @@ Structured logging with performance tracking:
 │   ├── error_handler.py            # Custom exceptions and decorators
 │   └── logger.py                   # Structured logging
 │
-├── ui/                             # Interactive Gradio UIs
+├── ui/                             # Interactive Gradio UIs (see ADR 0004)
+│   ├── common.py                   # Shared shell: ModelMenu, errors, truncation, launch
+│   ├── catalog.py                  # UI titles and ports (single source for launcher/app)
+│   ├── app.py                      # All UIs as tabs in one app
 │   ├── sentiment_playground.py     # Port 7860
 │   ├── similarity_explorer.py      # Port 7861
 │   ├── ner_visualizer.py           # Port 7862
 │   ├── summarization_studio.py     # Port 7863
-│   └── performance_dashboard.py    # Port 7864
+│   ├── performance_dashboard.py    # Port 7864
+│   ├── qa_system.py                # Port 7865
+│   ├── generation_playground.py    # Port 7866
+│   ├── zero_shot_classifier.py     # Port 7867
+│   ├── translation_hub.py          # Port 7868
+│   └── vision_language_explorer.py # Port 7869
 │
 ├── tests/                          # Test suite
 │   ├── conftest.py                 # Pytest fixtures
@@ -219,11 +228,18 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs:
 4. Add unit test in `tests/unit/test_config.py`
 
 ### Creating a New Interactive UI
-1. Create file in `ui/` directory (e.g., `ui/new_task.py`)
-2. Import from `config` and `utils` for consistency
-3. Use `load_model()` from model cache
-4. Create Gradio interface with `gr.Interface` or `gr.Blocks`
-5. Add launcher option in `launch_ui.py`
+1. Add an entry (key, title, emoji, module, port, description) to `ui/catalog.py`; the launcher and the combined app pick it up.
+2. Create `ui/<module>.py` following `ui/sentiment_playground.py`: import the shell with
+   `try: from ui import common as shell` / `except ModuleNotFoundError: import common as shell`,
+   and reach `config`/`utils` only through `shell` so `python ui/<module>.py` works.
+3. Build model choices with `shell.ModelMenu("<registry category>")` and load with `menu.load(name)`
+   (shared cache); never import `transformers` or call `pipeline()` in a UI.
+4. Validate with `shell.require_text` / `shell.split_items`, clip text with `shell.clip_for_model`,
+   report problems with `shell.fail` / `shell.fail_from` (gr.Error), escape HTML with `shell.esc`.
+5. Build the page inside `with shell.page(UI_KEY) as demo:`, add `shell.about(...)`, and end with
+   `if __name__ == "__main__": shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])`.
+6. Add `tests/unit/ui/test_<module>.py` using the fakes in `tests/unit/ui/conftest.py`;
+   `tests/unit/ui/test_ui_build.py` checks the architecture rules automatically.
 
 ### Adding Tests
 - Unit tests go in `tests/unit/` with `@pytest.mark.unit`
@@ -265,6 +281,9 @@ Key variables that can override settings:
 - `NLP_MAX_CACHED_MODELS=N`: Maximum cached models (default 3)
 - `NLP_CACHE_DIR=/path`: HuggingFace model cache directory
 - `NLP_SHARE=true`: Create public Gradio links
+- `NLP_SERVER_NAME=0.0.0.0`: Bind address for the UIs (default 127.0.0.1)
+- `NLP_UI_THEME=soft|default|glass|monochrome|base`: Gradio theme
+- `NLP_API__ANONYMOUS_RATE_LIMIT=N`: Per-IP limit for requests without valid credentials (default 20)
 
 ## Important Files and Their Purpose
 

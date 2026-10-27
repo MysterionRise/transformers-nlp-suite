@@ -16,7 +16,7 @@ The API service reads `.env.example` so a fresh clone can run immediately for lo
 ## Build Image
 
 ```bash
-docker build -t customer-intelligence-nlp:latest .
+docker build -t transformers-nlp-suite:latest .
 ```
 
 The Dockerfile defaults to:
@@ -25,7 +25,7 @@ The Dockerfile defaults to:
 python launch_ui.py api --host 0.0.0.0
 ```
 
-It exposes port `8000` plus optional Gradio UI ports.
+It exposes port `8000` for the API and `7860` for the combined demo UI app. Dependencies live in a virtualenv at `/opt/venv`, torch is the CPU build, the spaCy `en_core_web_sm` model is baked in, and the container runs as the unprivileged `nlpuser`. CI builds this image and smoke-tests it on every push.
 
 ## Run A Single API Container
 
@@ -33,12 +33,12 @@ For local testing without Compose:
 
 ```bash
 docker run --rm \
-  --name customer-intelligence-api \
+  --name transformers-nlp-suite-api \
   -p 8000:8000 \
   --env-file .env.example \
   -e NLP_REDIS_URL= \
   -v huggingface_cache:/home/nlpuser/.cache/huggingface \
-  customer-intelligence-nlp:latest
+  transformers-nlp-suite:latest
 ```
 
 The explicit empty `NLP_REDIS_URL` disables Redis for this single-container example. Use Docker Compose or a real Redis URL when you want shared rate limiting.
@@ -64,9 +64,11 @@ docker compose down
 Optional UI services:
 
 ```bash
-docker compose --profile ui up ui-launcher
-docker compose --profile individual up sentiment qa generation
+docker compose --profile ui up ui-launcher                     # every UI in one app on :7860
+docker compose --profile individual up sentiment qa generation  # one container per UI
 ```
+
+The two profiles both publish host port 7860 for sentiment, so run one or the other.
 
 ## Access Points
 
@@ -108,37 +110,37 @@ Minimal deployment shape:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: customer-intelligence-api
+  name: transformers-nlp-suite-api
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: customer-intelligence-api
+      app: transformers-nlp-suite-api
   template:
     metadata:
       labels:
-        app: customer-intelligence-api
+        app: transformers-nlp-suite-api
     spec:
       containers:
         - name: api
-          image: customer-intelligence-nlp:latest
+          image: transformers-nlp-suite:latest
           ports:
             - containerPort: 8000
           env:
             - name: NLP_REDIS_URL
               valueFrom:
                 secretKeyRef:
-                  name: customer-intelligence-secrets
+                  name: transformers-nlp-suite-secrets
                   key: redis-url
             - name: NLP_API__JWT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: customer-intelligence-secrets
+                  name: transformers-nlp-suite-secrets
                   key: jwt-secret
             - name: NLP_API__API_KEYS
               valueFrom:
                 secretKeyRef:
-                  name: customer-intelligence-secrets
+                  name: transformers-nlp-suite-secrets
                   key: api-keys
           readinessProbe:
             httpGet:

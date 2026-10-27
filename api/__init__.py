@@ -1,5 +1,5 @@
 """
-Customer Intelligence NLP Platform - Production REST API Service
+Transformers NLP Suite - Production REST API Service
 
 Provides a FastAPI-based REST API for NLP inference with:
 - JWT and API key authentication

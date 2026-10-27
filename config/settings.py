@@ -1,5 +1,5 @@
 """
-Settings and configuration management for the Customer Intelligence NLP Platform
+Settings and configuration management for the Transformers NLP Suite
 
 Uses Pydantic for settings validation and YAML for model configurations.
 """
@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     """
 
     # Application settings
-    app_name: str = "Customer Intelligence NLP Platform"
+    app_name: str = "Transformers NLP Suite"
     debug: bool = Field(default=False, description="Enable debug mode")
     log_level: str = Field(default="INFO", description="Logging level")
 
