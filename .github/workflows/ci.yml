@@ -12,15 +12,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
@@ -54,16 +54,16 @@ jobs:
         python-version: ['3.11', '3.12', '3.13']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
         allow-prereleases: true
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements*.txt') }}
@@ -74,6 +74,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install --index-url https://download.pytorch.org/whl/cpu torch
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
 
@@ -82,10 +83,10 @@ jobs:
         pytest -m "not slow" --cov=. --cov-report=xml --cov-report=term-missing
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       if: matrix.python-version == '3.11'
       with:
-        file: ./coverage.xml
+        files: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
@@ -95,15 +96,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python 3.11
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-3.11-${{ hashFiles('requirements*.txt') }}
@@ -112,7 +113,7 @@ jobs:
           ${{ runner.os }}-pip-
 
     - name: Cache transformers models
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-transformers-${{ hashFiles('requirements.txt') }}
@@ -122,6 +123,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install --index-url https://download.pytorch.org/whl/cpu torch
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
 
@@ -139,15 +141,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python 3.11
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-3.11-${{ hashFiles('requirements*.txt') }}
@@ -158,6 +160,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install --index-url https://download.pytorch.org/whl/cpu torch
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
 
@@ -171,8 +174,67 @@ jobs:
       timeout-minutes: 45
 
     - name: Upload coverage report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: coverage-report
         path: htmlcov/
         retention-days: 30
+
+  docker:
+    name: Docker image (build and smoke test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Build image
+      run: docker compose build api
+
+    - name: Start API and Redis
+      run: docker compose up -d api redis
+
+    - name: Wait for readiness
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS http://localhost:8000/ready; then echo; exit 0; fi
+          sleep 2
+        done
+        echo "API did not become ready"
+        curl -sS http://localhost:8000/ready || true
+        exit 1
+
+    - name: Smoke test the API
+      run: |
+        curl -fsS http://localhost:8000/health
+        curl -fsS http://localhost:8000/api/v1/models > /dev/null
+        # spaCy NER exercises the model baked into the image (no download needed)
+        curl -fsS -X POST http://localhost:8000/api/v1/ner \
+          -H "X-API-Key: demo-customer-intel-key" -H "Content-Type: application/json" \
+          -d '{"text": "Apple opened a new office in Paris."}'
+        # Missing credentials are 401; exhausting the anonymous limit is 429, never 500
+        test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+          -X POST http://localhost:8000/api/v1/sentiment -d '{"text": "x"}')" = "401"
+        codes=$(for i in $(seq 1 25); do curl -s -o /dev/null -w '%{http_code} ' http://localhost:8000/api/v1/models; done)
+        echo "$codes"
+        echo "$codes" | grep -q 429
+        if echo "$codes" | grep -q 500; then echo "server error while rate limited"; exit 1; fi
+
+    - name: Start the combined UI app
+      run: |
+        docker compose --profile ui up -d ui-launcher
+        for i in $(seq 1 60); do
+          if curl -fsS -o /dev/null http://localhost:7860/; then echo "UI is up"; exit 0; fi
+          sleep 2
+        done
+        echo "UI did not start"
+        exit 1
+
+    - name: Container logs
+      if: always()
+      run: docker compose --profile ui logs --no-color --tail 200
+
+    - name: Tear down
+      if: always()
+      run: docker compose --profile ui down -v
+
