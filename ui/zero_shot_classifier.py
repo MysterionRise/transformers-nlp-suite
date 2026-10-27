@@ -1,34 +1,49 @@
 """
-Zero-Shot Classifier - Interactive UI for zero-shot text classification
+Zero-Shot Classification - sort text into labels you define, without training data.
 
-Features:
-- Real-time zero-shot classification without training data
-- Multiple model comparison
-- Dynamic candidate label input
-- Multi-label classification support
-- Confidence visualization
-- Batch processing support
+Models come from the ``zero_shot`` registry category (natural language inference
+checkpoints) and load through the shared model cache. Each label is turned into a
+hypothesis ("This example is {label}.") and the model scores whether the text
+entails it.
 """
 
-import logging
-from typing import Dict, Tuple
+import re
+import sys
+from collections import Counter
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
+import pandas as pd
 import plotly.graph_objects as go
-from transformers import pipeline
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/zero_shot_classifier.py`
+    import common as shell  # type: ignore[no-redef]
 
-# Available zero-shot classification models
-ZS_MODELS = {
-    "BART Large MNLI": "facebook/bart-large-mnli",
-    "DeBERTa MNLI": "microsoft/deberta-v3-base",
-}
+logger = shell.get_logger(__name__)
 
-# Cache for loaded models
-model_cache = {}
+UI_KEY = "zero_shot"
+MODELS = shell.ModelMenu("zero_shot", default="bart_large_mnli")
+
+MAX_LABELS = 20
+MAX_LABEL_CHARS = 100
+HYPOTHESIS_RESERVE = 32  # tokens left free for "This example is {label}."
+APPLIES_THRESHOLD = 0.5
+BATCH_COLUMNS = ["#", "Text", "Top label", "Score", "All scores"]
+
+SINGLE_LABEL_NOTE = (
+    "Single-label: the scores are a softmax across your labels and add up to 100%. They say which label fits best "
+    "relative to the others, not whether any of them fits."
+)
+MULTI_LABEL_NOTE = (
+    "Multi-label: each label is scored on its own (entailment against contradiction), so the scores do not add up "
+    f"to 100%. Several labels, or none, can score high; labels at {APPLIES_THRESHOLD:.0%} or more are listed "
+    "as applying."
+)
+
+COLOR_TOP = "#2a9d8f"
+COLOR_OTHER = "#8d99ae"
 
 # Pre-defined label sets for common tasks
 LABEL_PRESETS = {
@@ -58,187 +73,156 @@ INDUSTRY_PRESETS = {
     "Medical: Specialty": "cardiology, oncology, neurology, orthopedics, pediatrics, psychiatry",
     "Medical: Clinical Intent": "symptom report, medication inquiry, test results, follow-up, adverse event",
 }
+INDUSTRY_GROUPS = {"Retail": "Retail", "Publishing": "Publishing", "Medical": "Medical / life sciences"}
 
 
-def load_model(model_name: str):
-    """Load or retrieve cached zero-shot classification model"""
-    if model_name not in model_cache:
-        logger.info(f"Loading model: {model_name}")
-        try:
-            model_cache[model_name] = pipeline(
-                "zero-shot-classification",
-                model=ZS_MODELS[model_name],
-            )
-            logger.info(f"Model {model_name} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model {model_name}: {e}")
-            raise
-    return model_cache[model_name]
+# --------------------------------------------------------------------------- input
+
+
+def parse_labels(value: str, multi_label: bool = False) -> List[str]:
+    """Comma- or newline-separated labels: stripped, de-duplicated (ignoring case) and validated."""
+    entered = [" ".join(item.split()) for item in re.split(r"[,\n]", value or "")]
+    entered = [label for label in entered if label]
+    labels: List[str] = []
+    seen = set()
+    for label in entered:
+        if label.casefold() not in seen:
+            seen.add(label.casefold())
+            labels.append(label)
+    if not labels:
+        shell.fail("Please enter candidate labels, separated by commas.")
+    duplicates = len(entered) - len(labels)
+    if duplicates:
+        shell.warn(f"{duplicates} duplicate label(s) were ignored.")
+    if len(labels) > MAX_LABELS:
+        shell.fail(f"Use at most {MAX_LABELS} labels (got {len(labels)}); each label costs one model pass.")
+    too_long = [label for label in labels if len(label) > MAX_LABEL_CHARS]
+    if too_long:
+        shell.fail(f"Labels must be at most {MAX_LABEL_CHARS} characters; shorten {too_long[0][:40]!r}...")
+    if not multi_label and len(labels) < 2:
+        shell.fail(
+            "Single-label mode needs at least 2 different labels to choose between. "
+            "Add another label or switch on multi-label mode to score one label on its own."
+        )
+    return labels
+
+
+# --------------------------------------------------------------------------- inference
+
+
+def _scores(raw: Dict[str, Any]) -> List[Tuple[str, float]]:
+    pairs = [(str(label), float(score)) for label, score in zip(raw["labels"], raw["scores"])]
+    return sorted(pairs, key=lambda pair: pair[1], reverse=True)
+
+
+def _chart(scores: List[Tuple[str, float]], multi_label: bool) -> go.Figure:
+    labels = [label for label, _ in reversed(scores)]
+    values = [score for _, score in reversed(scores)]
+    if multi_label:
+        colors = [COLOR_TOP if value >= APPLIES_THRESHOLD else COLOR_OTHER for value in values]
+        title = "Probability that each label applies (independent)"
+    else:
+        colors = [COLOR_TOP if index == len(values) - 1 else COLOR_OTHER for index in range(len(values))]
+        title = "Share of probability across labels (adds up to 100%)"
+    fig = go.Figure(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker_color=colors,
+            text=[f"{value:.1%}" for value in values],
+            textposition="auto",
+        )
+    )
+    if multi_label:
+        fig.add_vline(x=APPLIES_THRESHOLD, line_dash="dot", line_color=COLOR_OTHER)
+    fig.update_layout(
+        xaxis=dict(range=[0, 1], title=title, tickformat=".0%"),
+        height=80 + 40 * len(labels),
+        margin=dict(l=10, r=10, t=10, b=50),
+    )
+    return fig
 
 
 def classify_text(
     text: str,
     candidate_labels: str,
     model_name: str,
-    multi_class: bool = False,
-) -> Tuple[Dict, str]:
-    """
-    Classify text into candidate labels without training data
-
-    Args:
-        text: Input text to classify
-        candidate_labels: Comma-separated candidate labels
-        model_name: Name of the model to use
-        multi_class: Whether to treat as multi-label problem
-
-    Returns:
-        Tuple of (results dict, visualization HTML)
-    """
-    if not text or not text.strip():
-        return {"error": "Please provide text to classify"}, ""
-
-    if not candidate_labels or not candidate_labels.strip():
-        return {"error": "Please provide candidate labels (comma-separated)"}, ""
-
+    multi_label: bool = False,
+) -> Tuple[Dict[str, Any], go.Figure]:
+    """Classify one text; returns a result summary and a score chart."""
+    text = shell.require_text(text, "some text to classify")
+    multi_label = bool(multi_label)
+    labels = parse_labels(candidate_labels, multi_label)
+    choice = MODELS.get(model_name)
+    classifier = MODELS.load(model_name)
+    used = shell.clip_for_model(text, classifier, label="Text", reserve=HYPOTHESIS_RESERVE)
     try:
-        # Parse labels
-        labels = [label.strip() for label in candidate_labels.split(",")]
-        labels = [lbl for lbl in labels if lbl]  # Remove empty strings
+        raw = classifier(used, candidate_labels=labels, multi_label=multi_label)
+    except Exception as exc:
+        shell.fail_from(exc, "Zero-shot classification")
 
-        if not labels:
-            return {"error": "Invalid label format"}, ""
-
-        # Load model
-        classifier = load_model(model_name)
-
-        # Classify
-        result = classifier(
-            text,
-            labels,
-            multi_class=multi_class,
-        )
-
-        # Format results
-        formatted_results = {
-            "Text": text[:200] + ("..." if len(text) > 200 else ""),
-            "Top Classification": result["labels"][0],
-            "Confidence": f"{result['scores'][0] * 100:.2f}%",
-            "Model": model_name,
-            "Multi-class": multi_class,
-            "All Scores": {label: f"{score * 100:.2f}%" for label, score in zip(result["labels"], result["scores"])},
+    scores = _scores(raw)
+    top_label, top_score = scores[0]
+    result: Dict[str, Any] = {
+        "mode": "multi-label" if multi_label else "single-label",
+        "top_label": top_label,
+        "score": f"{top_score:.1%}",
+        "how_to_read": MULTI_LABEL_NOTE if multi_label else SINGLE_LABEL_NOTE,
+    }
+    if multi_label:
+        result["labels_that_apply"] = [label for label, score in scores if score >= APPLIES_THRESHOLD]
+    result.update(
+        {
+            "scores": {label: round(score, 4) for label, score in scores},
+            "model": choice.model_id,
+            "truncated": used != text,
         }
-
-        # Create visualization
-        fig = go.Figure(
-            data=[
-                go.Bar(
-                    x=result["scores"],
-                    y=result["labels"],
-                    orientation="h",
-                    marker=dict(color=result["scores"], colorscale="Viridis", showscale=False),
-                    text=[f"{s * 100:.1f}%" for s in result["scores"]],
-                    textposition="auto",
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title="Classification Scores",
-            xaxis_title="Confidence",
-            yaxis_title="Labels",
-            height=300,
-            margin=dict(l=20, r=20, t=40, b=20),
-            xaxis=dict(range=[0, 1]),
-        )
-
-        return formatted_results, fig
-
-    except Exception as e:
-        logger.error(f"Error classifying text: {e}")
-        return {"error": f"Error: {str(e)}"}, None
+    )
+    return result, _chart(scores, multi_label)
 
 
 def batch_classify(
     batch_text: str,
     candidate_labels: str,
     model_name: str,
-    multi_class: bool = False,
-    delimiter: str = "\n",
-) -> str:
-    """
-    Classify multiple texts
+    multi_label: bool = False,
+) -> Tuple[pd.DataFrame, str]:
+    """Classify one text per line against the same labels; a failing line is reported in its row."""
+    items = shell.split_items(batch_text, what="one line of text")
+    multi_label = bool(multi_label)
+    labels = parse_labels(candidate_labels, multi_label)
+    choice = MODELS.get(model_name)
+    classifier = MODELS.load(model_name)
+    budget = max(1, shell.token_limit(classifier) - HYPOTHESIS_RESERVE)
 
-    Args:
-        batch_text: Multiple texts separated by delimiter
-        candidate_labels: Comma-separated candidate labels
-        model_name: Model to use
-        multi_class: Multi-class mode
-        delimiter: Delimiter for splitting texts
+    rows, counts, truncated = [], Counter(), 0
+    for index, item in enumerate(items, 1):
+        used, _ = shell.truncate_to_tokens(item, classifier.tokenizer, budget)
+        truncated += used != item
+        try:
+            scores = _scores(classifier(used, candidate_labels=labels, multi_label=multi_label))
+        except Exception as exc:
+            logger.warning(f"Batch item {index} failed: {exc}")
+            rows.append([index, item, "error", "", str(exc)[:120]])
+            continue
+        label, score = scores[0]
+        counts[label] += 1
+        rows.append([index, item, label, f"{score:.1%}", " · ".join(f"{lbl} {s:.0%}" for lbl, s in scores)])
 
-    Returns:
-        Formatted results as string
-    """
-    if not batch_text or not batch_text.strip():
-        return "Please provide texts to classify"
-
-    if not candidate_labels or not candidate_labels.strip():
-        return "Please provide candidate labels"
-
-    try:
-        # Parse labels
-        labels = [label.strip() for label in candidate_labels.split(",")]
-        labels = [lbl for lbl in labels if lbl]
-
-        if not labels:
-            return "Invalid label format"
-
-        # Split texts
-        texts = [t.strip() for t in batch_text.split(delimiter) if t.strip()]
-
-        if not texts:
-            return "No valid texts found"
-
-        # Load model
-        classifier = load_model(model_name)
-
-        results = []
-        for i, txt in enumerate(texts, 1):
-            try:
-                result = classifier(txt, labels, multi_class=multi_class)
-
-                top_label = result["labels"][0]
-                top_score = result["scores"][0]
-
-                results.append(
-                    f"{i}. Text: {txt[:60]}{'...' if len(txt) > 60 else ''}\n"
-                    f"   Classification: {top_label} ({top_score * 100:.2f}%)\n"
-                )
-            except Exception as e:
-                results.append(f"{i}. Error: {str(e)}\n")
-
-        return "\n".join(results)
-
-    except Exception as e:
-        logger.error(f"Error in batch classification: {e}")
-        return f"Error: {str(e)}"
+    if truncated:
+        shell.warn(f"{truncated} line(s) exceeded the model's {budget}-token limit and were truncated.")
+    mode = "multi-label, scores are independent" if multi_label else "single-label, scores add up to 100%"
+    summary = " · ".join(f"**{label}**: {count}" for label, count in counts.most_common()) or "No results"
+    return (
+        pd.DataFrame(rows, columns=BATCH_COLUMNS),
+        f"{len(items)} texts classified with {choice.name} ({mode}). {summary}",
+    )
 
 
-# Example texts and labels for testing
 EXAMPLES = [
-    # General examples
-    [
-        "This movie was amazing! I loved every second of it.",
-        "positive, negative, neutral",
-        "BART Large MNLI",
-        False,
-    ],
-    [
-        "What time does the store open tomorrow?",
-        "question, statement, command, small talk",
-        "BART Large MNLI",
-        False,
-    ],
-    # Retail examples
+    ["This movie was amazing! I loved every second of it.", "positive, negative, neutral", "BART Large MNLI", False],
+    ["What time does the store open tomorrow?", "question, statement, command, small talk", "BART Large MNLI", False],
     [
         "I've been waiting 2 weeks for my order and customer service won't respond to my emails!",
         "complaint, praise, question, suggestion, return request",
@@ -249,220 +233,111 @@ EXAMPLES = [
         "The product quality is excellent but shipping took too long. Price was fair though.",
         "shipping, product quality, pricing, customer service, website issue",
         "BART Large MNLI",
-        True,  # Multi-class for multiple issues
-    ],
-    # Publishing examples
-    [
-        "The Federal Reserve announced today that interest rates will remain unchanged amid cooling inflation.",
-        "news, opinion, analysis, review, interview, breaking news",
-        "BART Large MNLI",
-        False,
+        True,
     ],
     [
         "In my view, the government's new climate policy falls short of what scientists recommend.",
         "objective, persuasive, informative, sensational, critical",
-        "DeBERTa MNLI",
+        "DeBERTa v3 NLI",
         False,
     ],
-    # Medical examples
     [
         "Patient presents with chest pain radiating to left arm, shortness of breath. ECG shows ST elevation.",
         "emergency, urgent, routine, elective, preventive",
-        "BART Large MNLI",
-        False,
-    ],
-    [
-        "62-year-old male with history of hypertension started on Lisinopril 20mg daily. Follow-up in 2 weeks.",
-        "diagnosis, treatment plan, progress note, discharge summary, consultation",
-        "BART Large MNLI",
+        "DeBERTa v3 NLI",
         False,
     ],
 ]
 
+ABOUT = f"""
+Zero-shot classification reuses a natural language inference (NLI) model: for each label it asks whether the text
+entails *"This example is {{label}}."* No training data is needed, but the wording of the labels matters.
 
-def create_ui():
-    """Create and configure the Gradio interface"""
+**Reading the scores**
 
-    with gr.Blocks(title="Zero-Shot Classifier", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-            # 🏷️ Zero-Shot Classifier
+- **Single-label** (default): the entailment scores are normalised with a softmax across your labels, so they add up
+  to 100%. The top label is the best fit *among the labels you gave*; a high score does not mean the label is right
+  if none of them really fits.
+- **Multi-label**: every label is scored independently (entailment against contradiction for that label alone), so
+  the scores do not add up to 100% and several labels can apply at once. Labels at
+  {APPLIES_THRESHOLD:.0%} or more are listed as applying.
 
-            Classify text into any categories without training data!
-            Simply provide your text and the labels you want to classify into.
-            """)
+**Labels**: separate them with commas; duplicates are ignored. Single-label mode needs at least 2 labels; at most
+{MAX_LABELS} are allowed, because each label is one model pass. Short, concrete labels ("shipping delay") work better
+than abstract ones.
+"""
 
-        with gr.Tab("Single Classification"):
+
+def _preset_button(label: str, preset: str, target: gr.Textbox) -> None:
+    """Button that fills `target` with a preset label set (a page helper, not an API endpoint)."""
+    gr.Button(label, size="sm").click(lambda: preset, outputs=target, api_visibility="private")
+
+
+def create_ui() -> gr.Blocks:
+    """Build the zero-shot classification page."""
+    with shell.page(UI_KEY) as demo:
+        with gr.Tab("Single text"):
             with gr.Row():
-                with gr.Column(scale=2):
+                with gr.Column(scale=3):
                     text_input = gr.Textbox(
-                        label="Enter text to classify",
-                        placeholder="Type or paste your text here...",
-                        lines=5,
+                        label="Text to classify", placeholder="Type or paste your text here...", lines=5
                     )
                     labels_input = gr.Textbox(
-                        label="Candidate Labels (comma-separated)",
+                        label="Candidate labels (comma-separated)",
                         placeholder="positive, negative, neutral",
                         lines=2,
                     )
-
-                with gr.Column(scale=1):
-                    model_dropdown = gr.Dropdown(
-                        choices=list(ZS_MODELS.keys()),
-                        value="BART Large MNLI",
-                        label="Select Model",
-                    )
-                    multi_class_toggle = gr.Checkbox(
-                        label="Multi-class (text can belong to multiple labels)",
-                        value=False,
+                    model_dropdown = MODELS.dropdown()
+                    multi_label_toggle = gr.Checkbox(
+                        label="Multi-label: score each label independently (several can apply)", value=False
                     )
                     classify_btn = gr.Button("Classify", variant="primary")
+                with gr.Column(scale=2):
+                    output_json = gr.JSON(label="Result")
+                    output_plot = gr.Plot(label="Scores")
 
-            with gr.Row():
-                with gr.Column():
-                    output_json = gr.JSON(label="Classification Results")
-                with gr.Column():
-                    output_plot = gr.Plot(label="Score Visualization")
-
-            gr.Markdown("### Label Presets")
-            gr.Markdown("**General Presets:**")
-            with gr.Row():
-                preset_buttons = []
-                for preset_name, preset_labels in LABEL_PRESETS.items():
-                    preset_buttons.append(gr.Button(preset_name, size="sm"))
-
-                # Connect preset buttons
-                for preset_labels_text, btn in zip(LABEL_PRESETS.values(), preset_buttons):
-                    btn.click(lambda x=preset_labels_text: x, outputs=labels_input)
-
-            gr.Markdown("**Industry Presets:**")
-            with gr.Row():
-                gr.Markdown("*Retail:*")
-            with gr.Row():
-                retail_presets = {k: v for k, v in INDUSTRY_PRESETS.items() if k.startswith("Retail:")}
-                for preset_name, preset_labels in retail_presets.items():
-                    btn = gr.Button(preset_name.replace("Retail: ", ""), size="sm")
-                    btn.click(lambda x=preset_labels: x, outputs=labels_input)
-
-            with gr.Row():
-                gr.Markdown("*Publishing:*")
-            with gr.Row():
-                publishing_presets = {k: v for k, v in INDUSTRY_PRESETS.items() if k.startswith("Publishing:")}
-                for preset_name, preset_labels in publishing_presets.items():
-                    btn = gr.Button(preset_name.replace("Publishing: ", ""), size="sm")
-                    btn.click(lambda x=preset_labels: x, outputs=labels_input)
-
-            with gr.Row():
-                gr.Markdown("*Medical/Life Sciences:*")
-            with gr.Row():
-                medical_presets = {k: v for k, v in INDUSTRY_PRESETS.items() if k.startswith("Medical:")}
-                for preset_name, preset_labels in medical_presets.items():
-                    btn = gr.Button(preset_name.replace("Medical: ", ""), size="sm")
-                    btn.click(lambda x=preset_labels: x, outputs=labels_input)
+            with gr.Accordion("Label presets", open=True):
+                with gr.Row():
+                    gr.Markdown("**General**")
+                    for name, preset in LABEL_PRESETS.items():
+                        _preset_button(name, preset, labels_input)
+                for prefix, title in INDUSTRY_GROUPS.items():
+                    with gr.Row():
+                        gr.Markdown(f"**{title}**")
+                        for name, preset in INDUSTRY_PRESETS.items():
+                            if name.startswith(f"{prefix}:"):
+                                _preset_button(name.split(": ", 1)[1], preset, labels_input)
 
             gr.Examples(
                 examples=EXAMPLES,
-                inputs=[text_input, labels_input, model_dropdown, multi_class_toggle],
-                label="Try these examples",
+                inputs=[text_input, labels_input, model_dropdown, multi_label_toggle],
+                label="Try an example",
             )
 
-        with gr.Tab("Batch Classification"):
-            gr.Markdown("""
-                ### Classify multiple texts at once
-                Enter multiple texts separated by new lines and provide candidate labels.
-                """)
-
+        with gr.Tab("Batch"):
+            gr.Markdown(f"One text per line, up to {shell.MAX_BATCH_ITEMS} lines, all scored against the same labels.")
             with gr.Row():
-                with gr.Column():
-                    batch_input = gr.Textbox(
-                        label="Enter texts (one per line)",
-                        placeholder="Text 1\nText 2\nText 3\n...",
-                        lines=10,
-                    )
-                    batch_labels = gr.Textbox(
-                        label="Candidate Labels",
-                        placeholder="label1, label2, label3",
-                        lines=2,
-                    )
+                with gr.Column(scale=2):
+                    batch_input = gr.Textbox(label="Texts (one per line)", placeholder="Text 1\nText 2", lines=10)
+                    batch_labels = gr.Textbox(label="Candidate labels", placeholder="label1, label2, label3", lines=2)
+                    batch_model = MODELS.dropdown()
+                    batch_multi_label = gr.Checkbox(label="Multi-label", value=False)
+                    batch_btn = gr.Button("Classify all", variant="primary")
+                with gr.Column(scale=3):
+                    batch_summary = gr.Markdown()
+                    batch_output = gr.Dataframe(headers=BATCH_COLUMNS, label="Results", wrap=True, interactive=False)
 
-                with gr.Column():
-                    batch_model = gr.Dropdown(
-                        choices=list(ZS_MODELS.keys()),
-                        value="BART Large MNLI",
-                        label="Select Model",
-                    )
-                    batch_multi_class = gr.Checkbox(
-                        label="Multi-class",
-                        value=False,
-                    )
-                    batch_btn = gr.Button("Classify All", variant="primary")
+        shell.about(ABOUT, MODELS)
 
-            batch_output = gr.Textbox(label="Batch Results", lines=15, max_lines=20)
-
-        with gr.Tab("About"):
-            gr.Markdown("""
-                ## About This Tool
-
-                Zero-shot classification allows you to classify text into any categories
-                without needing training examples. This is powered by natural language inference models.
-
-                ### Available Models:
-
-                1. **BART Large MNLI** - Trained on MNLI, good balance of speed and accuracy
-                2. **DeBERTa MNLI** - More advanced, typically better accuracy
-
-                ### How It Works:
-
-                - The model treats classification as an entailment problem
-                - For each label, it checks if the text entails "This text is about [label]"
-                - Scores represent the probability of entailment for each label
-
-                ### Parameters:
-
-                **Multi-class Mode:**
-                - Off (default): Each text assigned to most likely single label
-                - On: Text can be assigned to multiple labels with confidence scores
-
-                ### Use Cases:
-
-                - **Sentiment Analysis:** positive, negative, neutral
-                - **Intent Detection:** question, statement, command, small talk
-                - **Category Classification:** sports, technology, politics, etc.
-                - **Emotion Detection:** joy, sadness, anger, fear, disgust, surprise
-                - **Content Moderation:** toxic, hateful, safe
-                - **Language Identification:** English, Spanish, French, etc.
-
-                ### Tips:
-
-                - Use clear, descriptive labels for best results
-                - Shorter labels typically work better than longer ones
-                - Be specific with labels (e.g., "sports news" vs just "sports")
-                - Experiment with different label sets for the same text
-                - Use multi-class mode when texts can belong to multiple categories
-
-                ### Limitations:
-
-                - Works best with clear, unambiguous text
-                - May struggle with very short texts
-                - Requires good label descriptions
-                - Computationally more expensive than supervised classification
-                """)
-
-        # Connect the components
-        classify_btn.click(
-            fn=classify_text,
-            inputs=[text_input, labels_input, model_dropdown, multi_class_toggle],
-            outputs=[output_json, output_plot],
-        )
-
+        inputs = [text_input, labels_input, model_dropdown, multi_label_toggle]
+        classify_btn.click(classify_text, inputs=inputs, outputs=[output_json, output_plot])
         batch_btn.click(
-            fn=batch_classify,
-            inputs=[batch_input, batch_labels, batch_model, batch_multi_class],
-            outputs=[batch_output],
+            batch_classify,
+            inputs=[batch_input, batch_labels, batch_model, batch_multi_label],
+            outputs=[batch_output, batch_summary],
         )
-
     return demo
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7867, share=False, show_error=True)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])
