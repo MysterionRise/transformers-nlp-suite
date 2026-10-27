@@ -361,6 +361,18 @@ holds the latest batch results as JSON.
 """
 
 
+REGISTRY_COLUMNS = ["Category", "Key", "Name", "Model ID", "Task", "Framework"]
+
+
+def models_and_cache() -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """Shared model cache state and the full model registry."""
+    try:
+        info = shell.cache_info()
+    except Exception as exc:
+        shell.fail_from(exc, "Reading the model cache")
+    return info, pd.DataFrame(shell.registry_rows(), columns=REGISTRY_COLUMNS)
+
+
 def create_ui() -> gr.Blocks:
     """Build the evaluation page."""
     with shell.page(UI_KEY) as demo:
@@ -396,6 +408,17 @@ def create_ui() -> gr.Blocks:
             export_btn = gr.Button("Generate JSON export", variant="primary")
             export_output = gr.Code(label="JSON", language="json")
 
+        with gr.Tab("Models and cache"):
+            gr.Markdown(
+                "Models every tool can load (from `config/models.yaml`) and what the shared cache holds now. "
+                "In the combined app all tools share this cache, so loading one model can evict another."
+            )
+            refresh_btn = gr.Button("Refresh", variant="primary")
+            cache_json = gr.JSON(label="Model cache")
+            registry_table = gr.Dataframe(
+                headers=REGISTRY_COLUMNS, label="Model registry", wrap=True, interactive=False
+            )
+
         shell.about(ABOUT)
 
         evaluate_btn.click(
@@ -409,6 +432,7 @@ def create_ui() -> gr.Blocks:
             outputs=[batch_table, radar_chart, bar_chart, results_state],
         ).success(records_frame, inputs=results_state, outputs=export_table)
         export_btn.click(export_results, inputs=results_state, outputs=export_output)
+        refresh_btn.click(models_and_cache, outputs=[cache_json, registry_table])
     return demo
 
 

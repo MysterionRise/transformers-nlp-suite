@@ -50,6 +50,7 @@ __all__ = [
     "UIS",
     "UIInfo",
     "about",
+    "cache_info",
     "clip_for_model",
     "clip_to_tokens",
     "count_tokens",
@@ -66,6 +67,7 @@ __all__ = [
     "num_labels_of",
     "page",
     "parse_cli",
+    "registry_rows",
     "require_text",
     "split_items",
     "theme",
@@ -123,6 +125,23 @@ def load_by_id(model_id: str, task: str, action: Optional[str] = None) -> Any:
         return get_model_cache().get_model_by_id(model_id, task)
     except Exception as exc:
         fail_from(exc, action or f"Loading {model_id}")
+
+
+def cache_info() -> Dict[str, Any]:
+    """State of the shared model cache: device, size limit and loaded models (LRU order)."""
+    from utils.model_cache import get_cache_info
+
+    return get_cache_info()
+
+
+def registry_rows() -> List[List[str]]:
+    """One row per registry model: category, key, display name, model id, task, framework."""
+    registry = get_model_registry()
+    rows = []
+    for category in registry.list_categories():
+        for key, config in registry.get_category(category).items():
+            rows.append([category, key, config.name, config.model_id, config.task, config.framework or "transformers"])
+    return rows
 
 
 @dataclass(frozen=True)

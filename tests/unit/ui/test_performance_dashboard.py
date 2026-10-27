@@ -200,3 +200,19 @@ class TestBatch:
         assert isinstance(state, gr.State)
         assert any(output is state for output in batch.outputs)
         assert preview.inputs[0] is state and isinstance(preview.outputs[0], gr.Dataframe)
+
+
+class TestModelsAndCache:
+    def test_lists_registry_and_cache_state(self):
+        from unittest.mock import patch
+
+        from ui import common
+        from ui import performance_dashboard as ui
+
+        fake_info = {"cached_models": 1, "max_size": 3, "device": "cpu", "models": ["spacy::ner::spacy_sm"]}
+        with patch("ui.common.cache_info", return_value=fake_info):
+            info, table = ui.models_and_cache()
+        assert info == fake_info
+        assert list(table.columns) == ui.REGISTRY_COLUMNS
+        assert len(table) == len(common.registry_rows())
+        assert ("ner", "gliner_multi", "gliner") in set(zip(table["Category"], table["Key"], table["Framework"]))
