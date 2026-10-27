@@ -47,6 +47,12 @@ ENV PATH=/opt/venv/bin:$PATH \
 WORKDIR /app
 COPY --chown=nlpuser:nlpuser . .
 
+# Directories the runtime user writes to. Named volumes mounted on these paths
+# (logs, Hugging Face cache) start with this ownership, so downloads and log files work.
+RUN mkdir -p /app/logs /home/nlpuser/.cache/huggingface \
+    && chown nlpuser:nlpuser /app /app/logs \
+    && chown -R nlpuser:nlpuser /home/nlpuser/.cache
+
 USER nlpuser
 
 # 8000: REST API. 7860: combined demo UI app (`python launch_ui.py all`).

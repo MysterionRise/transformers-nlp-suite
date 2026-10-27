@@ -208,6 +208,10 @@ jobs:
       run: |
         curl -fsS http://localhost:8000/health
         curl -fsS http://localhost:8000/api/v1/models > /dev/null
+        # Similarity downloads a small model into the Hugging Face cache volume
+        curl -fsS -X POST http://localhost:8000/api/v1/similarity \
+          -H "X-API-Key: demo-customer-intel-key" -H "Content-Type: application/json" \
+          -d '{"text1": "The app is easy to use.", "text2": "Using the app is simple."}'
         # spaCy NER exercises the model baked into the image (no download needed)
         curl -fsS -X POST http://localhost:8000/api/v1/ner \
           -H "X-API-Key: demo-customer-intel-key" -H "Content-Type: application/json" \
