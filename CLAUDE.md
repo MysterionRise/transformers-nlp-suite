@@ -101,7 +101,7 @@ Structured logging with performance tracking:
 ├── config/                          # Configuration management
 │   ├── __init__.py
 │   ├── settings.py                 # Settings and ModelRegistry classes
-│   └── models.yaml                 # Model definitions (25+ models)
+│   └── models.yaml                 # Model registry (API and UIs)
 │
 ├── utils/                          # Shared utilities
 │   ├── __init__.py
