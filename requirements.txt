@@ -1,5 +1,5 @@
 numpy
-transformers[torch]>=4.40.0,<5.0.0
+transformers[torch]>=4.40.0,<6.0.0
 google-play-scraper
 sentencepiece
 protobuf>=4.25.8
