@@ -8,7 +8,7 @@ Supports automatic device detection (CPU, CUDA, MPS) and lazy loading.
 import gc
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from transformers import Pipeline, pipeline
@@ -29,7 +29,9 @@ class ModelCache:
     - Lazy loading (models loaded on first use)
     - LRU eviction when cache is full
     - Automatic device detection
-    - Thread-safe operations
+    - Thread-safe: cache bookkeeping is guarded by a re-entrant lock and each
+      cache key has its own load lock, so concurrent requests for the same cold
+      model load it once while requests for other models proceed in parallel
     - Memory cleanup
     """
 
@@ -56,6 +58,8 @@ class ModelCache:
         # OrderedDict for LRU cache
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._max_size = self.settings.max_cached_models
+        self._mutex = threading.RLock()
+        self._load_locks: Dict[str, threading.Lock] = {}
         self._device = self._detect_device()
 
         logger.info(f"ModelCache initialized with max_size={self._max_size}, device={self._device}")
@@ -117,16 +121,13 @@ class ModelCache:
 
         try:
             with PerformanceLogger(f"load_model_{model_id}", logger=logger):
-                # Determine device
-                device = None if self._device == "cpu" else 0  # Use first GPU if available
+                pipeline_kwargs: Dict[str, Any] = {"task": task, "model": model_id, "device": self._pipeline_device()}
+                if model_config.revision:
+                    pipeline_kwargs["revision"] = model_config.revision
+                if self.settings.cache_dir:
+                    pipeline_kwargs["model_kwargs"] = {"cache_dir": str(self.settings.cache_dir)}
 
-                # Load pipeline with appropriate parameters
-                model = pipeline(
-                    task=task,
-                    model=model_id,
-                    device=device,
-                    model_kwargs={"cache_dir": str(self.settings.cache_dir)},
-                )
+                model = pipeline(**pipeline_kwargs)
 
                 logger.info(f"Successfully loaded: {model_config.name}")
                 return model
@@ -145,7 +146,13 @@ class ModelCache:
             with PerformanceLogger(f"load_sentence_transformer_{model_id}", logger=logger):
                 from sentence_transformers import SentenceTransformer
 
-                model = SentenceTransformer(model_id, cache_folder=str(self.settings.cache_dir))
+                cache_folder = str(self.settings.cache_dir) if self.settings.cache_dir else None
+                model = SentenceTransformer(
+                    model_id,
+                    cache_folder=cache_folder,
+                    revision=model_config.revision,
+                    device=self._device,
+                )
                 logger.info(f"Successfully loaded sentence transformer: {model_config.name}")
                 return model
         except Exception as e:
@@ -168,6 +175,105 @@ class ModelCache:
         except Exception as e:
             logger.error(f"Failed to load spaCy model {model_id}: {str(e)}")
             raise ModelLoadError(model_id, original_error=e)
+
+    @retry_on_error(max_retries=1, delay=1.0)
+    def _load_gliner_model(self, model_config: ModelConfig) -> Any:
+        """Load a GLiNER zero-shot NER model."""
+        model_id = model_config.model_id
+        logger.info(f"Loading GLiNER model: {model_config.name} ({model_id})")
+
+        try:
+            with PerformanceLogger(f"load_gliner_{model_id}", logger=logger):
+                from gliner import GLiNER
+
+                kwargs: Dict[str, Any] = {}
+                if self.settings.cache_dir:
+                    kwargs["cache_dir"] = str(self.settings.cache_dir)
+                model = GLiNER.from_pretrained(model_id, **kwargs)
+                logger.info(f"Successfully loaded GLiNER model: {model_config.name}")
+                return model
+        except Exception as e:
+            logger.error(f"Failed to load GLiNER model {model_id}: {str(e)}")
+            raise ModelLoadError(model_id, original_error=e)
+
+    def _pipeline_device(self) -> Optional[str]:
+        """Device argument for transformers pipelines (None means CPU)."""
+        return None if self._device == "cpu" else self._device
+
+    def _key_lock(self, cache_key: str) -> threading.Lock:
+        with self._mutex:
+            lock = self._load_locks.get(cache_key)
+            if lock is None:
+                lock = self._load_locks[cache_key] = threading.Lock()
+            return lock
+
+    def _lookup(self, cache_key: str) -> Optional[Any]:
+        """Return a cached model and mark it most recently used, or None."""
+        with self._mutex:
+            if cache_key not in self._cache:
+                return None
+            self._cache.move_to_end(cache_key)
+            return self._cache[cache_key]
+
+    def _get_or_load(
+        self,
+        cache_key: str,
+        resolve_config: Callable[[], ModelConfig],
+        loader: Callable[[ModelConfig], Any],
+        context: Dict[str, Any],
+        force_reload: bool = False,
+    ) -> Any:
+        """
+        Shared lookup/load path for every model family.
+
+        Evicts before loading so peak memory stays near the configured cache size,
+        and holds a per-key lock while loading so concurrent cold requests for the
+        same model wait for one load instead of each loading their own copy.
+        """
+        if not force_reload:
+            model = self._lookup(cache_key)
+            if model is not None:
+                logger.debug(f"Cache hit: {cache_key}")
+                record_cache_hit(cache_key)
+                return model
+
+        with self._key_lock(cache_key):
+            if not force_reload:
+                model = self._lookup(cache_key)
+                if model is not None:
+                    logger.debug(f"Cache hit after waiting for load: {cache_key}")
+                    record_cache_hit(cache_key)
+                    return model
+
+            logger.debug(f"Cache miss: {cache_key}")
+            record_cache_miss(cache_key)
+            model_config = resolve_config()
+
+            with self._mutex:
+                self._cache.pop(cache_key, None)
+                while self._cache and len(self._cache) >= self._max_size:
+                    self._evict_lru()
+
+            with ErrorContext(context.pop("operation", "model_loading"), **context):
+                model = loader(model_config)
+
+            with self._mutex:
+                while self._cache and len(self._cache) >= self._max_size:
+                    self._evict_lru()
+                self._cache[cache_key] = model
+                size = len(self._cache)
+            logger.info(f"Added to cache: {cache_key} (cache size: {size}/{self._max_size})")
+            update_cache_size(size)
+            return model
+
+    def _registry_config(self, category: str, model_key: str) -> Callable[[], ModelConfig]:
+        def resolve() -> ModelConfig:
+            try:
+                return self.model_registry.get_model(category, model_key)
+            except KeyError as e:
+                raise ModelNotFoundError(model_key, category) from e
+
+        return resolve
 
     def _evict_lru(self):
         """Evict the least recently used model from cache"""
@@ -210,38 +316,13 @@ class ModelCache:
             ModelLoadError: If model fails to load
         """
         cache_key = self._generate_cache_key(category, model_key, task_override)
-
-        # Check cache (unless force reload)
-        if not force_reload and cache_key in self._cache:
-            logger.debug(f"Cache hit: {cache_key}")
-            record_cache_hit(cache_key)
-            # Move to end (mark as recently used)
-            self._cache.move_to_end(cache_key)
-            return self._cache[cache_key]
-
-        logger.debug(f"Cache miss: {cache_key}")
-        record_cache_miss(cache_key)
-
-        # Get model configuration
-        try:
-            model_config = self.model_registry.get_model(category, model_key)
-        except KeyError as e:
-            raise ModelNotFoundError(model_key, category) from e
-
-        # Evict if cache is full
-        while len(self._cache) >= self._max_size:
-            self._evict_lru()
-
-        # Load model
-        with ErrorContext("model_loading", category=category, model_key=model_key):
-            model = self._load_model(model_config, task=task_override)
-
-        # Add to cache
-        self._cache[cache_key] = model
-        logger.info(f"Added to cache: {cache_key} (cache size: {len(self._cache)}/{self._max_size})")
-        update_cache_size(len(self._cache))
-
-        return model
+        return self._get_or_load(
+            cache_key,
+            self._registry_config(category, model_key),
+            lambda config: self._load_model(config, task=task_override),
+            {"operation": "model_loading", "category": category, "model_key": model_key},
+            force_reload=force_reload,
+        )
 
     def get_sentence_transformer(
         self,
@@ -261,31 +342,13 @@ class ModelCache:
             Loaded SentenceTransformer model
         """
         cache_key = f"sentence-transformers::{category}::{model_key}"
-
-        if not force_reload and cache_key in self._cache:
-            logger.debug(f"Cache hit: {cache_key}")
-            record_cache_hit(cache_key)
-            self._cache.move_to_end(cache_key)
-            return self._cache[cache_key]
-
-        logger.debug(f"Cache miss: {cache_key}")
-        record_cache_miss(cache_key)
-
-        try:
-            model_config = self.model_registry.get_model(category, model_key)
-        except KeyError as e:
-            raise ModelNotFoundError(model_key, category) from e
-
-        while len(self._cache) >= self._max_size:
-            self._evict_lru()
-
-        with ErrorContext("sentence_transformer_loading", category=category, model_key=model_key):
-            model = self._load_sentence_transformer(model_config)
-
-        self._cache[cache_key] = model
-        logger.info(f"Added to cache: {cache_key} (cache size: {len(self._cache)}/{self._max_size})")
-        update_cache_size(len(self._cache))
-        return model
+        return self._get_or_load(
+            cache_key,
+            self._registry_config(category, model_key),
+            self._load_sentence_transformer,
+            {"operation": "sentence_transformer_loading", "category": category, "model_key": model_key},
+            force_reload=force_reload,
+        )
 
     def get_spacy_model(
         self,
@@ -303,31 +366,46 @@ class ModelCache:
             Loaded spaCy language pipeline
         """
         cache_key = f"spacy::ner::{model_key}"
+        return self._get_or_load(
+            cache_key,
+            self._registry_config("ner", model_key),
+            self._load_spacy_model,
+            {"operation": "spacy_model_loading", "category": "ner", "model_key": model_key},
+            force_reload=force_reload,
+        )
 
-        if not force_reload and cache_key in self._cache:
-            logger.debug(f"Cache hit: {cache_key}")
-            record_cache_hit(cache_key)
-            self._cache.move_to_end(cache_key)
-            return self._cache[cache_key]
+    def get_registry_model(self, category: str, model_key: str, force_reload: bool = False) -> Any:
+        """
+        Load any registry model, dispatching on its ``framework`` field.
 
-        logger.debug(f"Cache miss: {cache_key}")
-        record_cache_miss(cache_key)
-
+        ``transformers`` (default) returns a pipeline for the configured task,
+        ``sentence-transformers`` a SentenceTransformer, ``spacy`` a spaCy
+        Language and ``gliner`` a GLiNER model. This is the entry point the
+        Gradio UIs use, so every tool shares one LRU cache.
+        """
         try:
-            model_config = self.model_registry.get_model("ner", model_key)
+            framework = self.model_registry.get_model(category, model_key).framework or "transformers"
         except KeyError as e:
-            raise ModelNotFoundError(model_key, "ner") from e
+            raise ModelNotFoundError(model_key, category) from e
 
-        while len(self._cache) >= self._max_size:
-            self._evict_lru()
+        if framework == "sentence-transformers":
+            return self.get_sentence_transformer(category, model_key, force_reload=force_reload)
+        if framework == "spacy":
+            cache_key = f"spacy::{category}::{model_key}"
+            loader = self._load_spacy_model
+        elif framework == "gliner":
+            cache_key = f"gliner::{category}::{model_key}"
+            loader = self._load_gliner_model
+        else:
+            return self.get_model(category, model_key, force_reload=force_reload)
 
-        with ErrorContext("spacy_model_loading", category="ner", model_key=model_key):
-            model = self._load_spacy_model(model_config)
-
-        self._cache[cache_key] = model
-        logger.info(f"Added to cache: {cache_key} (cache size: {len(self._cache)}/{self._max_size})")
-        update_cache_size(len(self._cache))
-        return model
+        return self._get_or_load(
+            cache_key,
+            self._registry_config(category, model_key),
+            loader,
+            {"operation": f"{framework}_model_loading", "category": category, "model_key": model_key},
+            force_reload=force_reload,
+        )
 
     def get_model_by_id(self, model_id: str, task: str, force_reload: bool = False) -> Pipeline:
         """
@@ -343,37 +421,29 @@ class ModelCache:
         """
         cache_key = f"direct::{model_id}::{task}"
 
-        # Check cache
-        if not force_reload and cache_key in self._cache:
-            logger.debug(f"Cache hit: {cache_key}")
-            record_cache_hit(cache_key)
-            self._cache.move_to_end(cache_key)
-            return self._cache[cache_key]
-        record_cache_miss(cache_key)
+        def resolve() -> ModelConfig:
+            return ModelConfig(name=model_id, model_id=model_id, task=task)
 
-        # Evict if cache is full
-        while len(self._cache) >= self._max_size:
-            self._evict_lru()
+        def loader(config: ModelConfig) -> Any:
+            logger.info(f"Loading model by ID: {model_id} (task: {task})")
+            try:
+                return pipeline(task=task, model=model_id, device=self._pipeline_device())
+            except Exception as e:
+                raise ModelLoadError(model_id, original_error=e)
 
-        # Load model directly
-        logger.info(f"Loading model by ID: {model_id} (task: {task})")
-        try:
-            device = None if self._device == "cpu" else 0
-            model = pipeline(task=task, model=model_id, device=device)
-        except Exception as e:
-            raise ModelLoadError(model_id, original_error=e)
-
-        # Add to cache
-        self._cache[cache_key] = model
-        logger.info(f"Added to cache: {cache_key}")
-        update_cache_size(len(self._cache))
-
-        return model
+        return self._get_or_load(
+            cache_key,
+            resolve,
+            loader,
+            {"operation": "model_loading", "model_id": model_id},
+            force_reload=force_reload,
+        )
 
     def clear_cache(self):
         """Clear all cached models"""
-        logger.info(f"Clearing model cache ({len(self._cache)} models)")
-        self._cache.clear()
+        with self._mutex:
+            logger.info(f"Clearing model cache ({len(self._cache)} models)")
+            self._cache.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -382,8 +452,9 @@ class ModelCache:
     def remove_model(self, category: str, model_key: str):
         """Remove a specific model from cache"""
         cache_key = self._generate_cache_key(category, model_key)
-        if cache_key in self._cache:
-            del self._cache[cache_key]
+        with self._mutex:
+            removed = self._cache.pop(cache_key, None) is not None
+        if removed:
             logger.info(f"Removed from cache: {cache_key}")
             gc.collect()
             if torch.cuda.is_available():
@@ -411,12 +482,13 @@ class ModelCache:
         Returns:
             Dictionary with cache statistics
         """
-        return {
-            "cached_models": len(self._cache),
-            "max_size": self._max_size,
-            "device": self._device,
-            "models": list(self._cache.keys()),
-        }
+        with self._mutex:
+            return {
+                "cached_models": len(self._cache),
+                "max_size": self._max_size,
+                "device": self._device,
+                "models": list(self._cache.keys()),
+            }
 
     @property
     def device(self) -> str:
@@ -488,6 +560,11 @@ def load_sentence_transformer(category: str, model_key: str, **kwargs) -> Any:
     """
     cache = get_model_cache()
     return cache.get_sentence_transformer(category, model_key, **kwargs)
+
+
+def load_registry_model(category: str, model_key: str, **kwargs) -> Any:
+    """Load any registry model through the shared cache (see ModelCache.get_registry_model)."""
+    return get_model_cache().get_registry_model(category, model_key, **kwargs)
 
 
 def load_spacy_model(model_key: str, **kwargs) -> Any:

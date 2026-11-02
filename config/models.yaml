@@ -1,5 +1,11 @@
-# Model Configuration for Customer Intelligence NLP Platform
-# This file contains all model definitions used across the application
+# Model registry for the Transformers NLP Suite.
+# Single source of truth for the API and the Gradio UIs: UIs build their model
+# menus from these entries and load them through utils.model_cache.
+#
+# Fields: name, model_id, task (transformers pipeline task), description, and
+# optionally framework (transformers | sentence-transformers | spacy | gliner),
+# revision (pinned commit SHA), min_length/max_length, prefix, languages,
+# language_pairs, dimensions, domain, entity_types, modalities.
 
 # Sentiment Analysis Models
 sentiment_analysis:
@@ -85,6 +91,8 @@ embeddings:
     name: "All-MiniLM-L6-v2"
     model_id: "sentence-transformers/all-MiniLM-L6-v2"
     task: "feature-extraction"
+    framework: "sentence-transformers"
+    revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
     description: "Fast and efficient sentence embeddings"
     dimensions: 384
 
@@ -92,6 +100,7 @@ embeddings:
     name: "All-MPNet-Base-v2"
     model_id: "sentence-transformers/all-mpnet-base-v2"
     task: "feature-extraction"
+    framework: "sentence-transformers"
     description: "High quality sentence embeddings"
     dimensions: 768
 
@@ -99,6 +108,7 @@ embeddings:
     name: "Paraphrase Multilingual"
     model_id: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     task: "feature-extraction"
+    framework: "sentence-transformers"
     description: "Multilingual paraphrase model"
     dimensions: 384
     languages: ["en", "es", "fr", "de", "it", "pt", "nl", "zh", "ja", "ko"]
@@ -178,10 +188,10 @@ zero_shot:
     description: "BART fine-tuned on MNLI for zero-shot classification"
 
   deberta_mnli:
-    name: "DeBERTa MNLI"
-    model_id: "microsoft/deberta-v3-base"
+    name: "DeBERTa v3 NLI"
+    model_id: "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
     task: "zero-shot-classification"
-    description: "DeBERTa for zero-shot classification"
+    description: "DeBERTa-v3 base fine-tuned on MNLI, FEVER and ANLI for zero-shot classification"
 
 # Translation Models
 translation:
@@ -192,10 +202,11 @@ translation:
     description: "Multilingual translation (50+ languages)"
 
   helsinki_opus:
-    name: "Helsinki OPUS"
+    name: "Helsinki OPUS-MT"
     model_id: "Helsinki-NLP/opus-mt-en-es"
     task: "translation"
-    description: "High quality language pair specific models"
+    description: "Small, fast models for one language pair each (model_id is the en-es default)"
+    language_pairs: ["en-es", "en-fr", "en-de", "en-it", "en-pt", "es-en", "fr-en", "de-en", "it-en", "pt-en"]
 
 # Domain-Specific Models
 
@@ -286,34 +297,36 @@ vision_language:
   clip_vit_base:
     name: "CLIP ViT-B/32"
     model_id: "openai/clip-vit-base-patch32"
-    task: "vision-language"
+    task: "zero-shot-image-classification"
+    revision: "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
     description: "Vision-language model for image-text alignment"
     modalities: ["image", "text"]
 
   clip_vit_large:
     name: "CLIP ViT-L/14"
     model_id: "openai/clip-vit-large-patch14"
-    task: "vision-language"
+    task: "zero-shot-image-classification"
     description: "Large vision-language model with better accuracy"
-    modalities: ["image", "text"]
-
-  llava_v1_5:
-    name: "LLaVA 1.5 (7B)"
-    model_id: "llava-hf/llava-1.5-7b-hf"
-    task: "visual-question-answering"
-    description: "Vision-language model for image captioning and VQA"
     modalities: ["image", "text"]
 
   git_base:
     name: "GIT Base"
     model_id: "microsoft/git-base"
-    task: "image-captioning"
+    task: "image-to-text"
+    revision: "1f7fe8444292beb4a259e3a5b6eba440cd5999d4"
     description: "Generative Image-to-Text model"
     modalities: ["image"]
 
   git_large:
     name: "GIT Large"
     model_id: "microsoft/git-large"
-    task: "image-captioning"
+    task: "image-to-text"
     description: "Large version of GIT for better caption quality"
+    modalities: ["image"]
+
+  vit_gpt2_captioning:
+    name: "ViT-GPT2 Captioning"
+    model_id: "nlpconnect/vit-gpt2-image-captioning"
+    task: "image-to-text"
+    description: "Lightweight ViT encoder + GPT-2 decoder image captioner"
     modalities: ["image"]

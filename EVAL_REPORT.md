@@ -12,6 +12,7 @@ The GitHub Actions workflow currently runs:
 - Fast tests on Python 3.11, 3.12, and 3.13
 - Slow real-model integration tests on Python 3.11
 - Full test suite with coverage on Python 3.11
+- A Docker image build with API, rate-limit and UI smoke checks
 
 Fast tests mock inference and assert exact auth, validation, response, metrics/status, and aggregation behavior. Slow tests cover selected real model paths for sentiment, NER, summarization, similarity, and QA.
 

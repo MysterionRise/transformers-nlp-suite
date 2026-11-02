@@ -25,7 +25,7 @@ class TestSettings:
     def test_default_values(self):
         """Test default setting values"""
         settings = get_settings()
-        assert settings.app_name == "Customer Intelligence NLP Platform"
+        assert settings.app_name == "Transformers NLP Suite"
         assert settings.debug is False
         assert settings.log_level == "INFO"
         assert settings.max_cached_models == 3

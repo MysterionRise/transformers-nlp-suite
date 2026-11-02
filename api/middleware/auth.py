@@ -35,9 +35,20 @@ class TokenData(BaseModel):
     exp: datetime
 
 
-# Security schemes
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-bearer_scheme = HTTPBearer(auto_error=False)
+# Security schemes. The scheme names are what the OpenAPI document references, so
+# Swagger UI's "Authorize" dialog sends these credentials with "Try it out".
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    scheme_name="ApiKeyAuth",
+    description="API key from NLP_API__API_KEYS",
+    auto_error=False,
+)
+bearer_scheme = HTTPBearer(
+    scheme_name="BearerAuth",
+    bearerFormat="JWT",
+    description="JWT from POST /api/v1/auth/token",
+    auto_error=False,
+)
 
 
 def get_api_settings():
@@ -60,6 +71,25 @@ def _get_default_api_settings():
     return DefaultAPISettings()
 
 
+def lookup_api_key(api_key: Optional[str]) -> Optional[User]:
+    """
+    Return the user for an enabled API key, or None. Records no metrics, so the
+    rate limiter can call it without inflating auth_attempts_total.
+    """
+    if not api_key:
+        return None
+    user_data = get_api_settings().api_keys.get(api_key)
+    if not isinstance(user_data, dict) or not user_data.get("enabled", True):
+        return None
+    return User(
+        api_key=api_key,
+        name=str(user_data.get("name", "unnamed")),
+        role=str(user_data.get("role", "user")),
+        rate_limit=int(user_data.get("rate_limit") or getattr(get_api_settings(), "default_rate_limit", 100)),
+        enabled=True,
+    )
+
+
 def verify_api_key(api_key: str) -> Optional[User]:
     """
     Verify an API key and return the associated user
@@ -70,33 +100,11 @@ def verify_api_key(api_key: str) -> Optional[User]:
     Returns:
         User object if valid, None otherwise
     """
-    api_settings = get_api_settings()
-    api_keys = api_settings.api_keys
-
-    if api_key not in api_keys:
-        from utils.metrics import record_auth_attempt
-
-        record_auth_attempt("api_key", False)
-        return None
-
-    user_data = api_keys[api_key]
-    if not user_data.get("enabled", True):
-        from utils.metrics import record_auth_attempt
-
-        record_auth_attempt("api_key", False)
-        return None
-
     from utils.metrics import record_auth_attempt
 
-    record_auth_attempt("api_key", True)
-
-    return User(
-        api_key=api_key,
-        name=user_data["name"],
-        role=user_data["role"],
-        rate_limit=user_data.get("rate_limit", 100),
-        enabled=user_data.get("enabled", True),
-    )
+    user = lookup_api_key(api_key)
+    record_auth_attempt("api_key", user is not None)
+    return user
 
 
 def create_access_token(user: User, expires_delta: Optional[timedelta] = None) -> str:
@@ -111,6 +119,8 @@ def create_access_token(user: User, expires_delta: Optional[timedelta] = None) -
         Encoded JWT token string
     """
     api_settings = get_api_settings()
+    if not api_settings.jwt_secret:
+        raise RuntimeError("JWT signing is not configured: set NLP_API__JWT_SECRET")
 
     if expires_delta is None:
         expires_delta = timedelta(hours=api_settings.jwt_expiration_hours)
@@ -133,9 +143,35 @@ def create_access_token(user: User, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
+def jwt_subject(token: str) -> Optional[str]:
+    """
+    The API key a valid, unexpired JWT was issued for, or None. Records no metrics.
+
+    Tokens must carry an ``exp`` claim, and nothing validates while
+    NLP_API__JWT_SECRET is empty (fail closed).
+    """
+    api_settings = get_api_settings()
+    if not api_settings.jwt_secret or not token:
+        return None
+    try:
+        payload = jwt.decode(
+            token,
+            api_settings.jwt_secret,
+            algorithms=[api_settings.jwt_algorithm],
+            options={"require_exp": True},
+        )
+    except JWTError:
+        return None
+    subject = payload.get("sub")
+    return subject if isinstance(subject, str) and subject else None
+
+
 def verify_jwt_token(token: str) -> Optional[User]:
     """
     Verify a JWT token and return the associated user
+
+    The underlying API key is re-checked on every request, so disabling a key
+    also revokes the tokens issued for it.
 
     Args:
         token: JWT token string
@@ -143,31 +179,12 @@ def verify_jwt_token(token: str) -> Optional[User]:
     Returns:
         User object if valid, None otherwise
     """
-    api_settings = get_api_settings()
+    from utils.metrics import record_auth_attempt
 
-    try:
-        payload = jwt.decode(
-            token,
-            api_settings.jwt_secret,
-            algorithms=[api_settings.jwt_algorithm],
-        )
-
-        api_key: str = payload.get("sub")
-        if api_key is None:
-            return None
-
-        # Verify the underlying API key is still valid
-        user = verify_api_key(api_key)
-        from utils.metrics import record_auth_attempt
-
-        record_auth_attempt("jwt", user is not None)
-        return user
-
-    except JWTError:
-        from utils.metrics import record_auth_attempt
-
-        record_auth_attempt("jwt", False)
-        return None
+    subject = jwt_subject(token)
+    user = lookup_api_key(subject) if subject else None
+    record_auth_attempt("jwt", user is not None)
+    return user
 
 
 async def get_current_user(

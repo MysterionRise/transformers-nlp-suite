@@ -1,5 +1,5 @@
 """
-Configuration package for the Customer Intelligence NLP Platform
+Configuration package for the Transformers NLP Suite
 
 This package provides centralized configuration management for all models,
 settings, and application parameters.

@@ -100,3 +100,29 @@ class TestLaunchUI:
         assert result is False
         captured = capsys.readouterr()
         assert "Error launching UI" in captured.out
+
+
+class TestCatalogAndAllInOne:
+    """The launcher derives its list from ui/catalog.py and can start the combined app."""
+
+    def test_uis_match_catalog(self):
+        from ui.catalog import UIS as CATALOG
+
+        assert list(UIS) == list(CATALOG)
+        for key, entry in CATALOG.items():
+            assert UIS[key]["port"] == entry.port
+            assert UIS[key]["module"] == f"ui.{entry.module}"
+
+    @patch("subprocess.run")
+    def test_launch_runs_module_from_repo_root(self, mock_run):
+        import launch_ui as launcher
+
+        assert launch_ui("qa") is True
+        args, kwargs = mock_run.call_args
+        assert args[0][1:] == ["-m", "ui.qa_system"]
+        assert kwargs["cwd"] == launcher.PROJECT_ROOT
+
+    @patch("subprocess.run")
+    def test_launch_all_forwards_host_and_port(self, mock_run):
+        assert launch_ui("all", host="0.0.0.0", port=9000) is True
+        assert mock_run.call_args.args[0][1:] == ["-m", "ui.app", "--host", "0.0.0.0", "--port", "9000"]

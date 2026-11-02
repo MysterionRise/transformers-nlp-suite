@@ -1,5 +1,5 @@
 """
-Logging utilities for the Customer Intelligence NLP Platform
+Logging utilities for the Transformers NLP Suite
 
 Provides structured logging with rotation, formatting, and performance tracking.
 """

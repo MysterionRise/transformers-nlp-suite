@@ -1,18 +1,23 @@
 # Tests
 
-This directory contains the test suite for the NLP with Transformers Examples project.
+This directory contains the test suite for the Transformers NLP Suite.
 
 ## Structure
 
 ```
 tests/
-├── conftest.py              # Shared pytest fixtures
-├── unit/                    # Unit tests
-│   ├── test_launch_ui.py
-│   └── test_sentiment_analysis.py
-└── integration/             # Integration tests
-    ├── test_ui_imports.py
-    └── test_model_loading.py
+├── conftest.py                  # Shared pytest fixtures (sample texts)
+├── api/                         # FastAPI endpoint tests (TestClient)
+│   ├── conftest.py              # Fake inference service fixture
+│   ├── test_endpoints.py
+│   └── test_rate_limit_and_errors.py
+├── unit/                        # Fast unit tests
+│   ├── ui/                      # One file per Gradio UI, plus the shell
+│   │   ├── conftest.py          # FakeTokenizer, FakePipeline, fake_models fixture
+│   │   ├── test_common.py       # ui/common.py
+│   │   └── test_ui_build.py     # Architecture rules every UI must pass
+│   └── test_*.py                # config, cache, logger, error handler, launcher, text limits
+└── integration/                 # Slow tests that download real models
 ```
 
 ## Running Tests
@@ -83,9 +88,10 @@ Tests are automatically run on every push and pull request via GitHub Actions. S
 ### CI Jobs
 
 1. **Lint and Format Check** - Checks code style with black, isort, and flake8
-2. **Fast Tests** - Runs unit tests on Python 3.9, 3.10, and 3.11
-3. **Integration Tests** - Runs slow tests with model loading on Python 3.10
+2. **Fast Tests** - Runs unit tests on Python 3.11, 3.12, and 3.13
+3. **Integration Tests** - Runs slow tests with model loading on Python 3.11
 4. **All Tests** - Runs complete test suite and generates coverage report
+5. **Docker** - Builds the image and smoke-tests the API and the combined UI app
 
 ## Writing Tests
 

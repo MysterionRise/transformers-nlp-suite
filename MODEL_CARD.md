@@ -2,7 +2,7 @@
 
 ## System
 
-Customer Intelligence NLP Platform combines open-source NLP models behind a FastAPI service. The platform performs sentiment analysis, named entity recognition, semantic similarity, extractive question answering, and summarization.
+Transformers NLP Suite combines open-source NLP models behind a FastAPI service for customer-intelligence use cases. The platform performs sentiment analysis, named entity recognition, semantic similarity, extractive question answering, and summarization.
 
 ## Intended Use
 

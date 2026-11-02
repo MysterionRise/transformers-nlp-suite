@@ -49,3 +49,7 @@ Thumbs.db
 *.tmp
 temp/
 tmp/
+
+# Agent/editor state
+.claude/
+logs/

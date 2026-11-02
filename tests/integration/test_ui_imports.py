@@ -10,61 +10,6 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 
-class TestUIImports:
-    """Test that UI modules can be imported without errors"""
-
-    def test_sentiment_playground_import(self):
-        """Test importing sentiment_playground module"""
-        try:
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location(
-                "sentiment_playground", project_root / "ui" / "sentiment_playground.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            # Don't execute module to avoid loading models, just check it loads
-            assert module is not None
-        except Exception as e:
-            pytest.fail(f"Failed to import sentiment_playground: {e}")
-
-    def test_similarity_explorer_import(self):
-        """Test importing similarity_explorer module"""
-        try:
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location(
-                "similarity_explorer", project_root / "ui" / "similarity_explorer.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert module is not None
-        except Exception as e:
-            pytest.fail(f"Failed to import similarity_explorer: {e}")
-
-    def test_ner_visualizer_import(self):
-        """Test importing ner_visualizer module"""
-        try:
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location("ner_visualizer", project_root / "ui" / "ner_visualizer.py")
-            module = importlib.util.module_from_spec(spec)
-            assert module is not None
-        except Exception as e:
-            pytest.fail(f"Failed to import ner_visualizer: {e}")
-
-    def test_summarization_studio_import(self):
-        """Test importing summarization_studio module"""
-        try:
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location(
-                "summarization_studio", project_root / "ui" / "summarization_studio.py"
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert module is not None
-        except Exception as e:
-            pytest.fail(f"Failed to import summarization_studio: {e}")
-
-
 class TestTransformersPipeline:
     """Test basic transformers pipeline functionality"""
 

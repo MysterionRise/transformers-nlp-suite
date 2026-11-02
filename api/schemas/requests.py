@@ -5,15 +5,26 @@ All request models include validation, examples, and comprehensive documentation
 for beautiful OpenAPI/Swagger UI documentation.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, model_validator
+
+
+def _not_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("must contain non-whitespace characters")
+    return value
+
+
+# Text fields reject whitespace-only input (it used to be classified as "negative").
+NonBlank = AfterValidator(_not_blank)
+BatchText = Annotated[str, Field(min_length=1, max_length=5000), NonBlank]
 
 
 class SentimentRequest(BaseModel):
     """Request model for sentiment analysis"""
 
-    text: str = Field(
+    text: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=5000,
@@ -45,11 +56,11 @@ class SentimentRequest(BaseModel):
 class BatchTextRequest(BaseModel):
     """Request model for batch text processing"""
 
-    texts: List[str] = Field(
+    texts: List[BatchText] = Field(
         ...,
         min_length=1,
         max_length=100,
-        description="List of texts to process (max 100 items)",
+        description="List of texts to process (max 100 items, each 1-5000 characters)",
         json_schema_extra={
             "example": [
                 "Great product, highly recommend!",
@@ -67,7 +78,7 @@ class BatchTextRequest(BaseModel):
 class SummarizationRequest(BaseModel):
     """Request model for text summarization"""
 
-    text: str = Field(
+    text: Annotated[str, NonBlank] = Field(
         ...,
         min_length=50,
         max_length=50000,
@@ -103,6 +114,12 @@ class SummarizationRequest(BaseModel):
         description="Maximum length of the summary in tokens",
     )
 
+    @model_validator(mode="after")
+    def _check_lengths(self) -> "SummarizationRequest":
+        if self.min_length is not None and self.max_length is not None and self.min_length >= self.max_length:
+            raise ValueError("min_length must be smaller than max_length")
+        return self
+
     model_config = {
         "json_schema_extra": {
             "examples": [
@@ -125,7 +142,7 @@ class SummarizationRequest(BaseModel):
 class NERRequest(BaseModel):
     """Request model for Named Entity Recognition"""
 
-    text: str = Field(
+    text: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=10000,
@@ -164,14 +181,14 @@ class NERRequest(BaseModel):
 class SimilarityRequest(BaseModel):
     """Request model for semantic similarity computation"""
 
-    text1: str = Field(
+    text1: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=5000,
         description="First text for comparison",
         json_schema_extra={"example": "The cat sat on the mat."},
     )
-    text2: str = Field(
+    text2: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=5000,
@@ -200,14 +217,14 @@ class SimilarityRequest(BaseModel):
 class QARequest(BaseModel):
     """Request model for Question Answering"""
 
-    question: str = Field(
+    question: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=500,
         description="Question to answer",
         json_schema_extra={"example": "What is the capital of France?"},
     )
-    context: str = Field(
+    context: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=10000,
@@ -257,7 +274,7 @@ class CustomerTextItem(BaseModel):
         description="Optional caller-provided item identifier",
         json_schema_extra={"example": "review-001"},
     )
-    text: str = Field(
+    text: Annotated[str, NonBlank] = Field(
         ...,
         min_length=1,
         max_length=5000,

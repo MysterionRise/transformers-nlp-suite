@@ -1,5 +1,5 @@
 """
-Utilities package for the Customer Intelligence NLP Platform
+Utilities package for the Transformers NLP Suite
 
 This package provides shared utilities for error handling, logging,
 model caching, and other common functionality.
@@ -29,6 +29,7 @@ _MODEL_CACHE_EXPORTS = {
     "load_model_by_id",
     "load_sentence_transformer",
     "load_spacy_model",
+    "load_registry_model",
     "clear_model_cache",
     "get_cache_info",
 }
@@ -71,6 +72,7 @@ __all__ = [
     "load_model_by_id",
     "load_sentence_transformer",
     "load_spacy_model",
+    "load_registry_model",
     "clear_model_cache",
     "get_cache_info",
 ]

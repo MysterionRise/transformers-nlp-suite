@@ -1,5 +1,5 @@
 """
-Error handling utilities for the Customer Intelligence NLP Platform
+Error handling utilities for the Transformers NLP Suite
 
 Provides custom exceptions and error handling decorators for graceful degradation.
 """

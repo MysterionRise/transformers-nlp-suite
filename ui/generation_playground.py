@@ -1,507 +1,355 @@
 """
-Text Generation Playground - Interactive UI for text generation
+Text Generation - continue a prompt with GPT-2 family models.
 
-Features:
-- Real-time text generation from prompts
-- Multiple model comparison
-- Parameter control (length, temperature, top-p)
-- Batch processing support
-- Example prompts for quick testing
+Models come from the ``text_generation`` registry category and load through the
+shared model cache. Sampling is seeded with ``torch.manual_seed``, which is
+process-global, so seeding and generating happen under one lock: two users with
+the same seed and settings get the same text even when they generate at once.
 """
 
-import logging
-from typing import Dict
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gradio as gr
-from transformers import pipeline
+import pandas as pd
+import torch
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from ui import common as shell
+except ModuleNotFoundError:  # running as `python ui/generation_playground.py`
+    import common as shell  # type: ignore[no-redef]
 
-# Available text generation models
-GENERATION_MODELS = {
-    "GPT-2": "gpt2",
-    "GPT-2 Medium": "gpt2-medium",
-    "DistilGPT-2": "distilgpt2",
-}
+logger = shell.get_logger(__name__)
 
-# Cache for loaded models
-model_cache = {}
+UI_KEY = "generation"
+MODELS = shell.ModelMenu("text_generation", default="gpt2")
+COMPARE_DEFAULT = [MODELS.get("gpt2").name, MODELS.get("distilgpt2").name]
+
+DEFAULT_NEW_TOKENS = 60
+MAX_NEW_TOKENS = 200
+MAX_SAMPLES = 3
+MAX_BATCH_PROMPTS = 20
+MAX_SEED = 2**32 - 1
+DEFAULT_SEED = 42
+BATCH_COLUMNS = ["#", "Prompt", "Continuation"]
+
+# Guards torch.manual_seed + generation: the RNG is shared by every request in the process.
+_GENERATE_LOCK = threading.Lock()
 
 
-def load_model(model_name: str):
-    """Load or retrieve cached text generation model"""
-    if model_name not in model_cache:
-        logger.info(f"Loading model: {model_name}")
-        try:
-            model_cache[model_name] = pipeline(
-                "text-generation",
-                model=GENERATION_MODELS[model_name],
-                tokenizer=GENERATION_MODELS[model_name],
-            )
-            logger.info(f"Model {model_name} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model {model_name}: {e}")
-            raise
-    return model_cache[model_name]
+# --------------------------------------------------------------------------- validation
+
+
+def _seed_value(seed: Any) -> Optional[int]:
+    """None for an empty seed (random output), otherwise a validated integer seed."""
+    if seed is None or (isinstance(seed, str) and not seed.strip()):
+        return None
+    try:
+        value = int(float(seed))
+    except (TypeError, ValueError, OverflowError):
+        shell.fail(f"Seed must be a whole number between 0 and {MAX_SEED}.")
+    if not 0 <= value <= MAX_SEED:
+        shell.fail(f"Seed must be a whole number between 0 and {MAX_SEED}.")
+    return value
+
+
+def _in_range(value: Any, low: float, high: float, name: str, cast=float) -> Any:
+    try:
+        number = cast(value)
+    except (TypeError, ValueError, OverflowError):
+        shell.fail(f"{name} must be a number between {low} and {high}.")
+    if not low <= number <= high:
+        shell.fail(f"{name} must be between {low} and {high}.")
+    return number
+
+
+def _sampling(
+    max_new_tokens: Any, temperature: Any, top_p: Any, top_k: Any = 50, num_return_sequences: Any = 1
+) -> Dict[str, Any]:
+    """Validated sampling settings shared by every tab."""
+    return {
+        "max_new_tokens": _in_range(max_new_tokens, 1, MAX_NEW_TOKENS, "New tokens", int),
+        "temperature": _in_range(temperature, 0.01, 2.0, "Temperature"),
+        "top_p": _in_range(top_p, 0.01, 1.0, "Top-p"),
+        "top_k": _in_range(top_k, 0, 1000, "Top-k", int),
+        "num_return_sequences": _in_range(num_return_sequences, 1, MAX_SAMPLES, "Samples", int),
+    }
+
+
+# --------------------------------------------------------------------------- inference
+
+
+def _generate(generator: Any, prompt: str, seed: Optional[int], settings: Dict[str, Any]) -> List[str]:
+    """Generate continuations of `prompt` (without the prompt itself)."""
+    kwargs = dict(settings, do_sample=True, return_full_text=False)
+    eos = getattr(generator.tokenizer, "eos_token_id", None)
+    if eos is not None:  # GPT-2 style models have no pad token; pad with the model's own EOS
+        kwargs["pad_token_id"] = eos
+    with _GENERATE_LOCK:
+        if seed is not None:
+            torch.manual_seed(seed)
+        outputs = generator(prompt, **kwargs)
+    if outputs and isinstance(outputs[0], list):
+        outputs = outputs[0]
+    return [output["generated_text"] for output in outputs]
+
+
+def _sample_html(prompt: str, continuation: str, title: str = "") -> str:
+    heading = f'<span class="tns-label">{shell.esc(title)}</span><br>' if title else ""
+    if not continuation.strip():
+        continuation_html = '<span class="tns-label">the model stopped without adding text</span>'
+    else:
+        continuation_html = shell.esc(continuation)
+    return (
+        f'<div class="tns-text" style="margin-bottom: 0.75rem">{heading}'
+        f"<strong>{shell.esc(prompt)}</strong>{continuation_html}</div>"
+    )
+
+
+# --------------------------------------------------------------------------- handlers
 
 
 def generate_text(
     prompt: str,
     model_name: str,
-    max_length: int = 100,
+    max_new_tokens: int = DEFAULT_NEW_TOKENS,
     temperature: float = 0.7,
     top_p: float = 0.9,
     top_k: int = 50,
     num_return_sequences: int = 1,
-    seed: int = None,
-) -> Dict[str, any]:
-    """
-    Generate text from a prompt
-
-    Args:
-        prompt: Input prompt
-        model_name: Name of the model to use
-        max_length: Maximum length of generated text
-        temperature: Sampling temperature (controls randomness)
-        top_p: Nucleus sampling parameter
-        top_k: Top-k sampling parameter
-        num_return_sequences: Number of sequences to generate
-        seed: Random seed for reproducibility
-
-    Returns:
-        Dictionary with generated texts and metadata
-    """
-    if not prompt or not prompt.strip():
-        return {"error": "Please provide a prompt"}
-
+    seed: Optional[int] = DEFAULT_SEED,
+) -> Tuple[str, Dict[str, Any]]:
+    """Continue one prompt; returns the samples as HTML (prompt in bold) and the run details."""
+    prompt = shell.require_text(prompt, "a prompt")
+    choice = MODELS.get(model_name)
+    seed = _seed_value(seed)
+    settings = _sampling(max_new_tokens, temperature, top_p, top_k, num_return_sequences)
+    generator = MODELS.load(model_name)
+    used = shell.clip_for_model(prompt, generator, label="Prompt", reserve=settings["max_new_tokens"])
     try:
-        # Load model
-        generator = load_model(model_name)
+        continuations = _generate(generator, used, seed, settings)
+    except Exception as exc:
+        shell.fail_from(exc, "Text generation")
 
-        # Set seed for reproducibility if provided
-        if seed is not None:
-            import torch
-
-            torch.manual_seed(seed)
-
-        # Generate text
-        outputs = generator(
-            prompt,
-            max_length=max_length,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_return_sequences=min(num_return_sequences, 5),  # Limit to 5 for performance
-            do_sample=True,
-            pad_token_id=50256,  # GPT2 EOS token
-        )
-
-        # Format results
-        generated_texts = []
-        for i, output in enumerate(outputs, 1):
-            generated_texts.append(output["generated_text"])
-
-        formatted_results = {
-            "Prompt": prompt,
-            "Model": model_name,
-            "Parameters": {
-                "max_length": max_length,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "sequences": len(outputs),
-            },
-            "Samples": generated_texts,
-        }
-
-        return formatted_results
-
-    except Exception as e:
-        logger.error(f"Error generating text: {e}")
-        return {"error": f"Error: {str(e)}"}
+    many = len(continuations) > 1
+    html = "".join(
+        _sample_html(used, text, f"Sample {index}" if many else "") for index, text in enumerate(continuations, 1)
+    )
+    details = {
+        "model": choice.model_id,
+        "seed": seed,
+        "settings": settings,
+        "prompt_truncated": used != prompt,
+        "samples": [used + text for text in continuations],
+    }
+    return html, details
 
 
 def compare_models(
     prompt: str,
-    max_length: int = 100,
+    model_names: Sequence[str],
+    max_new_tokens: int = DEFAULT_NEW_TOKENS,
     temperature: float = 0.7,
     top_p: float = 0.9,
-    seed: int = None,
-) -> Dict[str, str]:
-    """
-    Compare text generation across all models
+    seed: Optional[int] = DEFAULT_SEED,
+) -> str:
+    """Run the same prompt and seed through each selected model, one model at a time."""
+    prompt = shell.require_text(prompt, "a prompt")
+    names = list(dict.fromkeys(model_names or []))
+    if not names:
+        shell.fail("Select at least one model to compare.")
+    choices = [MODELS.get(name) for name in names]
+    seed = _seed_value(seed)
+    settings = _sampling(max_new_tokens, temperature, top_p)
+    cache_size = shell.get_settings().max_cached_models
+    if len(choices) > cache_size:
+        shell.warn(
+            f"{len(choices)} models selected but the model cache holds {cache_size}. They run one after another "
+            "and earlier models may be unloaded, so this is slower and the next run reloads them."
+        )
 
-    Args:
-        prompt: Input prompt
-        max_length: Maximum length
-        temperature: Sampling temperature
-        top_p: Nucleus sampling parameter
-        seed: Random seed
+    cards, failures = [], []
+    for choice in choices:
+        started = time.perf_counter()
+        try:
+            generator = MODELS.load(choice.name)
+            used = shell.clip_for_model(prompt, generator, label="Prompt", reserve=settings["max_new_tokens"])
+            [text] = _generate(generator, used, seed, settings)
+        except Exception as exc:
+            message = getattr(exc, "message", None) or str(exc)
+            logger.warning(f"Comparison with {choice.name} failed: {message}")
+            failures.append(f"{choice.name}: {message}")
+            cards.append(
+                f'<div class="tns-text" style="margin-bottom: 0.75rem"><span class="tns-label">'
+                f"{shell.esc(choice.name)} · failed</span><br>{shell.esc(message[:300])}</div>"
+            )
+            continue
+        cards.append(_sample_html(used, text, f"{choice.name} · {time.perf_counter() - started:.1f} s"))
 
-    Returns:
-        Dictionary with comparisons
-    """
-    if not prompt or not prompt.strip():
-        return {"error": "Please provide a prompt"}
-
-    try:
-        results = {}
-
-        for model_name in GENERATION_MODELS.keys():
-            try:
-                generator = load_model(model_name)
-
-                if seed is not None:
-                    import torch
-
-                    torch.manual_seed(seed)
-
-                output = generator(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=50,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    pad_token_id=50256,
-                )
-
-                results[model_name] = output[0]["generated_text"]
-            except Exception as e:
-                logger.error(f"Error with {model_name}: {e}")
-                results[model_name] = f"Error: {str(e)}"
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Error in model comparison: {e}")
-        return {"error": f"Error: {str(e)}"}
+    if len(failures) == len(choices):
+        shell.fail("Every selected model failed. " + " ".join(failures)[:400])
+    return "".join(cards)
 
 
 def batch_generate(
-    batch_prompts: str,
+    prompts: str,
     model_name: str,
-    max_length: int = 100,
+    max_new_tokens: int = DEFAULT_NEW_TOKENS,
     temperature: float = 0.7,
-) -> str:
-    """
-    Generate text for multiple prompts
+    seed: Optional[int] = DEFAULT_SEED,
+) -> Tuple[pd.DataFrame, str]:
+    """Continue one prompt per line; a failing prompt is reported in its row."""
+    items = shell.split_items(prompts, max_items=MAX_BATCH_PROMPTS, what="one prompt")
+    choice = MODELS.get(model_name)
+    seed = _seed_value(seed)
+    settings = _sampling(max_new_tokens, temperature, 0.9)
+    generator = MODELS.load(model_name)
+    budget = max(1, shell.token_limit(generator) - settings["max_new_tokens"])
 
-    Args:
-        batch_prompts: Multiple prompts separated by newlines
-        model_name: Model to use
-        max_length: Maximum length
-        temperature: Sampling temperature
+    rows, clipped, failed = [], 0, 0
+    for index, item in enumerate(items, 1):
+        used, _ = shell.truncate_to_tokens(item, generator.tokenizer, budget)
+        clipped += used != item
+        try:
+            [text] = _generate(generator, used, seed, settings)
+            rows.append([index, used, text])
+        except Exception as exc:
+            logger.warning(f"Batch prompt {index} failed: {exc}")
+            failed += 1
+            rows.append([index, used, f"error: {str(exc)[:120]}"])
 
-    Returns:
-        Formatted results as string
-    """
-    if not batch_prompts or not batch_prompts.strip():
-        return "Please provide prompts"
-
-    try:
-        generator = load_model(model_name)
-
-        # Split prompts
-        prompts = [p.strip() for p in batch_prompts.split("\n") if p.strip()]
-
-        if not prompts:
-            return "No valid prompts found"
-
-        results = []
-        for i, prompt in enumerate(prompts, 1):
-            try:
-                output = generator(
-                    prompt,
-                    max_length=max_length,
-                    temperature=temperature,
-                    top_p=0.9,
-                    top_k=50,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    pad_token_id=50256,
-                )
-
-                generated = output[0]["generated_text"]
-                results.append(
-                    f"{i}. Prompt: {prompt[:60]}{'...' if len(prompt) > 60 else ''}\n"
-                    f"   Generated: {generated[:100]}{'...' if len(generated) > 100 else ''}\n"
-                )
-            except Exception as e:
-                results.append(f"{i}. Error: {str(e)}\n")
-
-        return "\n".join(results)
-
-    except Exception as e:
-        logger.error(f"Error in batch generation: {e}")
-        return f"Error: {str(e)}"
+    if clipped:
+        shell.warn(f"{clipped} prompt(s) exceeded the model's {budget}-token prompt budget and were truncated.")
+    summary = f"{len(items)} prompts continued with {choice.name}"
+    summary += f" (seed {seed}, each prompt seeded the same way)." if seed is not None else " (random seed)."
+    if failed:
+        summary += f" **{failed} failed.**"
+    return pd.DataFrame(rows, columns=BATCH_COLUMNS), summary
 
 
-# Example prompts for testing
 EXAMPLES = [
-    [
-        "The future of artificial intelligence",
-        "GPT-2",
-        100,
-        0.7,
-    ],
-    [
-        "Once upon a time, in a galaxy far away",
-        "GPT-2",
-        100,
-        0.8,
-    ],
-    [
-        "Scientists discovered a new species",
-        "GPT-2 Medium",
-        100,
-        0.6,
-    ],
-    [
-        "The weather today is",
-        "DistilGPT-2",
-        100,
-        0.5,
-    ],
+    ["The future of artificial intelligence", "GPT-2", 0.7],
+    ["Once upon a time, in a galaxy far away", "GPT-2", 0.9],
+    ["Scientists discovered a new species of", "DistilGPT-2", 0.6],
+    ["The weather today is", "DistilGPT-2", 0.5],
 ]
 
+ABOUT = f"""
+The models continue your prompt one token at a time, sampling each token from the model's predicted distribution.
 
-def create_ui():
-    """Create and configure the Gradio interface"""
+- **New tokens**: how much text to add (the prompt does not count). Prompts longer than the model's context minus
+  the new tokens are cut, and you get a warning.
+- **Temperature**: below 1 makes likely tokens more likely (focused, repetitive); above 1 flattens the distribution
+  (varied, often incoherent).
+- **Top-p / top-k**: sample only from the smallest set of tokens whose probabilities add up to p, or from the k most
+  likely tokens (0 disables top-k).
+- **Seed**: the same seed, model, prompt and settings give the same text. Clear it for a different result each run.
 
-    with gr.Blocks(title="Text Generation Playground", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-            # 📝 Text Generation Playground
+The comparison tab runs the models one after another with the same seed. The model cache holds
+{shell.get_settings().max_cached_models} models; selecting more works but reloads models. GPT-2 models were trained
+on web text from 2019: they can be wrong, repetitive or biased, and they do not follow instructions.
+"""
 
-            Generate creative text completions using state-of-the-art language models.
-            Experiment with different prompts, models, and parameters!
-            """)
 
-        with gr.Tab("Single Generation"):
+def _settings_controls() -> Tuple[gr.Slider, gr.Slider, gr.Slider]:
+    new_tokens = gr.Slider(10, MAX_NEW_TOKENS, value=DEFAULT_NEW_TOKENS, step=10, label="New tokens")
+    temperature = gr.Slider(
+        0.1, 2.0, value=0.7, step=0.1, label="Temperature", info="Lower = more focused, higher = more random"
+    )
+    top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p (nucleus)")
+    return new_tokens, temperature, top_p
+
+
+def _seed_input() -> gr.Number:
+    return gr.Number(
+        label="Seed",
+        value=DEFAULT_SEED,
+        precision=0,
+        minimum=0,
+        maximum=MAX_SEED,
+        info="Same seed and settings give the same text; clear it for random output.",
+    )
+
+
+def create_ui() -> gr.Blocks:
+    """Build the text generation page."""
+    with shell.page(UI_KEY) as demo:
+        with gr.Tab("Generate"):
             with gr.Row():
-                with gr.Column(scale=2):
+                with gr.Column(scale=3):
                     prompt_input = gr.Textbox(
-                        label="Enter your prompt",
-                        placeholder="Start typing and see the model complete your text...",
-                        lines=5,
+                        label="Prompt", placeholder="Start a sentence and let the model continue it...", lines=5
                     )
-                    model_dropdown = gr.Dropdown(
-                        choices=list(GENERATION_MODELS.keys()),
-                        value="GPT-2",
-                        label="Select Model",
-                    )
-
-                with gr.Column(scale=1):
-                    max_length_slider = gr.Slider(
-                        minimum=20,
-                        maximum=200,
-                        value=100,
-                        step=10,
-                        label="Max Length",
-                    )
-                    temperature_slider = gr.Slider(
-                        minimum=0.1,
-                        maximum=2.0,
-                        value=0.7,
-                        step=0.1,
-                        label="Temperature",
-                        info="Lower = more focused, Higher = more random",
-                    )
-                    top_p_slider = gr.Slider(
-                        minimum=0.1,
-                        maximum=1.0,
-                        value=0.9,
-                        step=0.05,
-                        label="Top-p (Nucleus)",
-                    )
-                    top_k_slider = gr.Slider(
-                        minimum=0,
-                        maximum=100,
-                        value=50,
-                        step=5,
-                        label="Top-k",
-                    )
-                    gr.Number(
-                        label="Seed (for reproducibility)",
-                        value=42,
-                        precision=0,
-                    )
+                    model_dropdown = MODELS.dropdown()
                     generate_btn = gr.Button("Generate", variant="primary")
+                with gr.Column(scale=2):
+                    new_tokens, temperature, top_p = _settings_controls()
+                    top_k = gr.Slider(0, 100, value=50, step=5, label="Top-k")
+                    samples = gr.Slider(1, MAX_SAMPLES, value=1, step=1, label="Samples")
+                    seed = _seed_input()
+            output_html = gr.HTML(label="Generated text")
+            with gr.Accordion("Details", open=False):
+                output_json = gr.JSON(label="Run details")
+            gr.Examples(examples=EXAMPLES, inputs=[prompt_input, model_dropdown, temperature], label="Try an example")
 
-            output_json = gr.JSON(label="Generation Results")
+        with gr.Tab("Compare models"):
+            gr.Markdown("Same prompt, settings and seed for each selected model, run one model at a time.")
+            with gr.Row():
+                with gr.Column(scale=3):
+                    compare_prompt = gr.Textbox(label="Prompt", lines=5)
+                    compare_models_input = gr.CheckboxGroup(
+                        choices=MODELS.names, value=COMPARE_DEFAULT, label="Models to compare"
+                    )
+                    compare_btn = gr.Button("Compare models", variant="primary")
+                with gr.Column(scale=2):
+                    compare_tokens, compare_temperature, compare_top_p = _settings_controls()
+                    compare_seed = _seed_input()
+            compare_output = gr.HTML(label="Outputs")
 
-            gr.Examples(
-                examples=EXAMPLES,
-                inputs=[prompt_input, model_dropdown, max_length_slider, temperature_slider],
-                label="Try these examples",
-            )
-
-        with gr.Tab("Model Comparison"):
-            gr.Markdown("""
-                ### Compare all models on the same prompt
-                Generate text with different models to see how they differ in style and quality.
-                """)
-
+        with gr.Tab("Batch"):
+            gr.Markdown(f"One prompt per line, up to {MAX_BATCH_PROMPTS} prompts.")
             with gr.Row():
                 with gr.Column(scale=2):
-                    compare_prompt = gr.Textbox(
-                        label="Enter prompt",
-                        placeholder="Your prompt here...",
-                        lines=5,
-                    )
-
-                with gr.Column(scale=1):
-                    compare_max_length = gr.Slider(
-                        minimum=20,
-                        maximum=200,
-                        value=100,
-                        step=10,
-                        label="Max Length",
-                    )
-                    compare_temperature = gr.Slider(
-                        minimum=0.1,
-                        maximum=2.0,
-                        value=0.7,
-                        step=0.1,
-                        label="Temperature",
-                    )
-                    compare_top_p = gr.Slider(
-                        minimum=0.1,
-                        maximum=1.0,
-                        value=0.9,
-                        step=0.05,
-                        label="Top-p",
-                    )
-                    compare_seed = gr.Number(
-                        label="Seed",
-                        value=42,
-                        precision=0,
-                    )
-                    compare_btn = gr.Button("Compare Models", variant="primary")
-
-            compare_output = gr.JSON(label="Model Comparison")
-
-        with gr.Tab("Batch Generation"):
-            gr.Markdown("""
-                ### Generate text for multiple prompts
-                Enter multiple prompts (one per line) and generate continuations for all of them.
-                """)
-
-            with gr.Row():
-                with gr.Column():
                     batch_prompts = gr.Textbox(
-                        label="Enter prompts (one per line)",
-                        placeholder="Prompt 1\nPrompt 2\nPrompt 3\n...",
-                        lines=10,
+                        label="Prompts (one per line)", placeholder="Prompt 1\nPrompt 2", lines=8
                     )
+                    batch_model = MODELS.dropdown()
+                    batch_tokens = gr.Slider(10, MAX_NEW_TOKENS, value=DEFAULT_NEW_TOKENS, step=10, label="New tokens")
+                    batch_temperature = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
+                    batch_seed = _seed_input()
+                    batch_btn = gr.Button("Generate all", variant="primary")
+                with gr.Column(scale=3):
+                    batch_summary = gr.Markdown()
+                    batch_output = gr.Dataframe(headers=BATCH_COLUMNS, label="Results", wrap=True, interactive=False)
 
-                with gr.Column():
-                    batch_model = gr.Dropdown(
-                        choices=list(GENERATION_MODELS.keys()),
-                        value="GPT-2",
-                        label="Select Model",
-                    )
-                    batch_max_length = gr.Slider(
-                        minimum=20,
-                        maximum=200,
-                        value=100,
-                        step=10,
-                        label="Max Length",
-                    )
-                    batch_temperature = gr.Slider(
-                        minimum=0.1,
-                        maximum=2.0,
-                        value=0.7,
-                        step=0.1,
-                        label="Temperature",
-                    )
-                    batch_btn = gr.Button("Generate Batch", variant="primary")
+        shell.about(ABOUT, MODELS)
 
-            batch_output = gr.Textbox(label="Batch Results", lines=15, max_lines=20)
-
-        with gr.Tab("About"):
-            gr.Markdown("""
-                ## About This Tool
-
-                This text generation playground uses GPT-2 based models to generate creative text completions.
-
-                ### Available Models:
-
-                1. **GPT-2** - Fast baseline model
-                2. **GPT-2 Medium** - Better quality, slower inference
-                3. **DistilGPT-2** - Distilled version, fastest
-
-                ### Parameters:
-
-                **Temperature:** Controls randomness
-                - 0.1 = Very focused, repetitive
-                - 0.7 = Balanced (default)
-                - 2.0 = Very random, chaotic
-
-                **Top-p (Nucleus):** Only consider tokens with cumulative probability ≤ p
-                - Lower values = more focused
-                - Higher values = more diverse
-
-                **Top-k:** Only consider top-k most likely next tokens
-                - Controls diversity
-
-                **Seed:** Use same seed for reproducible results
-
-                ### Tips:
-
-                - Start with descriptive prompts for better results
-                - Adjust temperature based on desired creativity
-                - Use lower temperature for technical writing
-                - Use higher temperature for creative writing
-                - Compare models to see quality differences
-                - Batch processing is useful for testing multiple prompts
-
-                ### Limitations:
-
-                - Generated text quality depends on prompt quality
-                - Models can produce nonsensical text
-                - May be biased based on training data
-                - Cannot follow complex instructions
-                """)
-
-        # Connect the components
         generate_btn.click(
-            fn=generate_text,
-            inputs=[
-                prompt_input,
-                model_dropdown,
-                max_length_slider,
-                temperature_slider,
-                top_p_slider,
-                top_k_slider,
-            ],
-            outputs=[output_json],
+            generate_text,
+            inputs=[prompt_input, model_dropdown, new_tokens, temperature, top_p, top_k, samples, seed],
+            outputs=[output_html, output_json],
         )
-
         compare_btn.click(
-            fn=compare_models,
+            compare_models,
             inputs=[
                 compare_prompt,
-                compare_max_length,
+                compare_models_input,
+                compare_tokens,
                 compare_temperature,
                 compare_top_p,
                 compare_seed,
             ],
             outputs=[compare_output],
         )
-
         batch_btn.click(
-            fn=batch_generate,
-            inputs=[batch_prompts, batch_model, batch_max_length, batch_temperature],
-            outputs=[batch_output],
+            batch_generate,
+            inputs=[batch_prompts, batch_model, batch_tokens, batch_temperature, batch_seed],
+            outputs=[batch_output, batch_summary],
         )
-
     return demo
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(server_name="0.0.0.0", server_port=7866, share=False, show_error=True)
+    shell.launch(create_ui(), UI_KEY, argv=sys.argv[1:])
