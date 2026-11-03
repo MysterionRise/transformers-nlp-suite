@@ -31,8 +31,11 @@ updates:
     ignore:
       - dependency-name: "torch"
         update-types: ["version-update:semver-major"]
+      # A version range, not update-types: the "semver-major" rule did not stop
+      # Dependabot widening "<5.0.0" to "<6.0.0" (PR #30), and transformers 5 breaks
+      # the real-model tests. Remove this once the code is migrated to transformers 5.
       - dependency-name: "transformers"
-        update-types: ["version-update:semver-major"]
+        versions: [">=5.0.0"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
